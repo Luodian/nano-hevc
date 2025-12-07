@@ -31,6 +31,14 @@ from nano_hevc.transform import (
     DCT32,
     DST4,
 )
+from nano_hevc.quant import (
+    quantize,
+    dequantize,
+    quantize_block,
+    dequantize_block,
+    QUANT_SCALE,
+    DEQUANT_SCALE,
+)
 
 __all__ = [
     "Plane",
@@ -59,4 +67,10 @@ __all__ = [
     "DCT16",
     "DCT32",
     "DST4",
+    "quantize",
+    "dequantize",
+    "quantize_block",
+    "dequantize_block",
+    "QUANT_SCALE",
+    "DEQUANT_SCALE",
 ]
