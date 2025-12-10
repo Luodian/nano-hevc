@@ -1,4 +1,4 @@
-![](https://i.postimg.cc/cCZTCzmg/image.png)
+<img width="2752" height="1536" alt="Gemini_Generated_Image_s0u74hs0u74hs0u7" src="https://github.com/user-attachments/assets/95f9e48f-0b32-4008-9f7d-9b6b20b8cc4d" />
 
 A minimal, educational HEVC (H.265) encoder written in Python.
 
