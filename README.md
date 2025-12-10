@@ -24,14 +24,11 @@ The code prioritizes clarity and readability over performance.
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/nano-hevc.git
 cd nano-hevc
 
-# Install with uv (recommended)
 uv sync
 
-# Or with pip
 pip install -e ".[dev]"
 ```
 
@@ -43,11 +40,11 @@ from nano_hevc.intra import intra_dc_predict, intra_planar_predict, residual_blo
 from nano_hevc.transform import forward_transform, inverse_transform
 from nano_hevc.quant import quantize_block, dequantize_block
 
-# Reference pixels (for 4x4 block)
+# reference pixels (for 4x4 block)
 top = np.array([102, 98, 100, 101], dtype=np.int16)
 left = np.array([103, 102, 101, 99], dtype=np.int16)
 
-# Original block
+# original block
 orig = np.array([
     [102, 101, 100, 100],
     [103, 102, 101, 100],
@@ -55,31 +52,32 @@ orig = np.array([
     [104, 101,  99,  98],
 ], dtype=np.int16)
 
-# DC prediction
+# dc prediction
 pred = intra_dc_predict(top, left, size=4)
 print(f"DC value: {pred[0, 0]}")  # 101
 
-# Compute residual
+# compute residual
 residual = residual_block(orig, pred)
 
-# Transform (DST for 4x4 luma intra)
+# transform (dst for 4x4 luma intra)
 coeff = forward_transform(residual, use_dst=True)
 
 # Quantize (QP=22 for decent quality)
 levels = quantize_block(coeff, qp=22)
 print(f"Non-zero coefficients: {np.count_nonzero(levels)}")
 
-# Decoder side: dequantize and inverse transform
+# decoder side: dequantize and inverse transform
 recon_coeff = dequantize_block(levels, qp=22)
 recon_residual = inverse_transform(recon_coeff, use_dst=True)
 ```
 
 ## Running Tests
 
+> to make sure that I understand the HEVC's logic correctly, I advise GPT5.1/Gemini 3.0 Pro and industry experts to provide test suggestions before I start the project.
+
 ```bash
 uv run pytest
 
-# Or if using pip
 pytest
 ```
 
@@ -110,11 +108,22 @@ nano_hevc/
 
 ## References
 
-- ITU-T H.265 / ISO/IEC 23008-2 (HEVC specification)
-- "High Efficiency Video Coding (HEVC)" by Sze, Budagavi, Sullivan
 - [HEVC/H.265 Video Coding Standard Tutorial](https://www.youtube.com/watch?v=Fawcboio6g4)
 - [H.265/HEVC Tutorial (MIT/ISCAS 2014)](https://eems.mit.edu/wp-content/uploads/2014/06/H.265-HEVC-Tutorial-2014-ISCAS.pdf)
 
 ## License
 
 MIT License
+
+Use as you wish.
+
+```bibtex
+@misc{nano-hevc,
+  author = {Bo Li},
+  title = {nano-hevc: A minimal, educational HEVC encoder in Python},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/luodian/nano-hevc}}
+}
+```
