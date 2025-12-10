@@ -32,41 +32,26 @@ class TestPlanarPredict:
         assert pred.dtype == np.int16
         assert np.all(pred == 100)
 
-    def test_planar_horizontal_gradient(self):
+    @pytest.mark.parametrize(
+        "top,right,left_edge,bottom_left,axis",
+        [
+            (np.zeros(4, dtype=np.int16), 255, np.zeros(4, dtype=np.int16), 0, "horizontal"),
+            (np.zeros(4, dtype=np.int16), 0, np.zeros(4, dtype=np.int16), 255, "vertical"),
+        ],
+    )
+    def test_planar_gradients(self, top, right, left_edge, bottom_left, axis):
         """
-        Left column = 0, top_right = 255 creates horizontal gradient.
-        Top row = 0, bottom_left = 0 to isolate horizontal component.
-        """
-        size = 4
-        top = np.zeros(size, dtype=np.int16)
-        left = np.zeros(size, dtype=np.int16)
-        top_right = 255
-        bottom_left = 0
-
-        pred = intra_planar_predict(top, left, top_right, bottom_left, size)
-
-        # Values should increase left to right
-        for y in range(size):
-            for x in range(size - 1):
-                assert pred[y, x] < pred[y, x + 1]
-
-    def test_planar_vertical_gradient(self):
-        """
-        Top row = 0, bottom_left = 255 creates vertical gradient.
-        Left column = 0, top_right = 0 to isolate vertical component.
+        Gradient cases ensure interpolation moves in the expected direction.
         """
         size = 4
-        top = np.zeros(size, dtype=np.int16)
-        left = np.zeros(size, dtype=np.int16)
-        top_right = 0
-        bottom_left = 255
+        pred = intra_planar_predict(top, left_edge, right, bottom_left, size)
 
-        pred = intra_planar_predict(top, left, top_right, bottom_left, size)
-
-        # Values should increase top to bottom
-        for y in range(size - 1):
+        if axis == "horizontal":
+            for y in range(size):
+                assert np.all(np.diff(pred[y, :]) > 0)
+        else:
             for x in range(size):
-                assert pred[y, x] < pred[y + 1, x]
+                assert np.all(np.diff(pred[:, x]) > 0)
 
     def test_planar_4x4_corners(self):
         """
@@ -90,44 +75,15 @@ class TestPlanarPredict:
         # pred[3,3] = ((0*0 + 4*255) + (0*0 + 4*255) + 4) >> 3 = 2044 >> 3 = 255
         assert pred[3, 3] == 255
 
-    def test_planar_8x8(self):
-        """Test 8x8 block with uniform references."""
-        size = 8
-        top = np.full(size, 128, dtype=np.int16)
-        left = np.full(size, 128, dtype=np.int16)
-        top_right = 128
-        bottom_left = 128
+    @pytest.mark.parametrize("size,value", [(4, 100), (8, 128), (16, 200), (32, 50)])
+    def test_planar_uniform_sizes(self, size, value):
+        """Uniform reference should remain uniform across sizes."""
+        top = np.full(size, value, dtype=np.int16)
+        left = np.full(size, value, dtype=np.int16)
+        pred = intra_planar_predict(top, left, value, value, size)
 
-        pred = intra_planar_predict(top, left, top_right, bottom_left, size)
-
-        assert pred.shape == (8, 8)
-        assert np.all(pred == 128)
-
-    def test_planar_16x16(self):
-        """Test 16x16 block with uniform references."""
-        size = 16
-        top = np.full(size, 200, dtype=np.int16)
-        left = np.full(size, 200, dtype=np.int16)
-        top_right = 200
-        bottom_left = 200
-
-        pred = intra_planar_predict(top, left, top_right, bottom_left, size)
-
-        assert pred.shape == (16, 16)
-        assert np.all(pred == 200)
-
-    def test_planar_32x32(self):
-        """Test 32x32 block with uniform references."""
-        size = 32
-        top = np.full(size, 50, dtype=np.int16)
-        left = np.full(size, 50, dtype=np.int16)
-        top_right = 50
-        bottom_left = 50
-
-        pred = intra_planar_predict(top, left, top_right, bottom_left, size)
-
-        assert pred.shape == (32, 32)
-        assert np.all(pred == 50)
+        assert pred.shape == (size, size)
+        assert np.all(pred == value)
 
 
 class TestPlanarIntegration:

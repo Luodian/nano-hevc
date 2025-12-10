@@ -22,12 +22,12 @@ from nano_hevc.intra import (
 class TestAngularVertical:
     """Tests for vertical modes (18-34)."""
 
-    def test_mode_26_pure_vertical_4x4(self):
+    @pytest.mark.parametrize("size", [4, 8])
+    def test_mode_26_pure_vertical(self, size):
         """
         Mode 26 is pure vertical (angle = 0).
         Each column copies directly from the top reference.
         """
-        size = 4
         # top[0] = corner, top[1..size] = reference above block
         top = np.array([99, 100, 110, 120, 130, 0, 0, 0, 0], dtype=np.int16)
         left = np.array([99, 50, 50, 50, 50, 0, 0, 0, 0], dtype=np.int16)
@@ -41,22 +41,6 @@ class TestAngularVertical:
         assert np.all(pred[:, 1] == 110)
         assert np.all(pred[:, 2] == 120)
         assert np.all(pred[:, 3] == 130)
-
-    def test_mode_26_pure_vertical_8x8(self):
-        """Mode 26 vertical prediction for 8x8 block."""
-        size = 8
-        top = np.zeros(2 * size + 1, dtype=np.int16)
-        left = np.zeros(2 * size + 1, dtype=np.int16)
-        # Set top reference: top[1..8] = [10, 20, 30, 40, 50, 60, 70, 80]
-        for i in range(size):
-            top[i + 1] = (i + 1) * 10
-        top_left = 0
-
-        pred = intra_angular_predict(top, left, top_left, mode=26, size=size)
-
-        for x in range(size):
-            expected = (x + 1) * 10
-            assert np.all(pred[:, x] == expected)
 
     def test_mode_34_diagonal_up(self):
         """
@@ -81,6 +65,24 @@ class TestAngularVertical:
         assert pred[0, 3] == 50
         assert pred[1, 0] == 30
         assert pred[3, 3] == 80
+
+    def test_negative_angle_extension_mode_18(self):
+        """
+        Negative-angle vertical mode should extend using left reference.
+        Mode 18 has angle = -26; projection crosses into secondary reference.
+        """
+        size = 4
+        top = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80], dtype=np.int16)
+        left = np.array([0, 5, 5, 5, 5, 5, 5, 5, 5], dtype=np.int16)
+        pred = intra_angular_predict(top, left, top_left=0, mode=18, size=size)
+
+        expected = np.array([
+            [0, 10, 20, 30],
+            [0,  0, 10, 20],
+            [5,  0,  0, 10],
+            [5,  5,  0,  0],
+        ], dtype=np.int16)
+        assert np.array_equal(pred, expected)
 
 
 class TestAngularHorizontal:

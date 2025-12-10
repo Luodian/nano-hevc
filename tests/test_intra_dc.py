@@ -42,32 +42,18 @@ class TestDCPredict4x4:
         assert pred.dtype == np.int16
         assert np.all(pred == 101)
 
-    def test_dc_4x4_uniform_reference(self):
-        """Test DC prediction with uniform reference pixels."""
-        top = np.array([100, 100, 100, 100], dtype=np.int16)
-        left = np.array([100, 100, 100, 100], dtype=np.int16)
-
+    @pytest.mark.parametrize(
+        "top,left,expected",
+        [
+            (np.full(4, 100, dtype=np.int16), np.full(4, 100, dtype=np.int16), 100),
+            (np.array([1, 1, 1, 1], dtype=np.int16), np.array([1, 1, 1, 0], dtype=np.int16), 1),
+            (np.zeros(4, dtype=np.int16), np.zeros(4, dtype=np.int16), 0),
+        ],
+    )
+    def test_dc_4x4_variants(self, top, left, expected):
+        """Grouped sanity checks for uniform, rounding and zero references."""
         pred = intra_dc_predict_4x4(top, left)
-
-        assert np.all(pred == 100)
-
-    def test_dc_4x4_rounding(self):
-        """Test that rounding works correctly."""
-        # sum = 7, so (7 + 4) >> 3 = 11 >> 3 = 1
-        top = np.array([1, 1, 1, 1], dtype=np.int16)
-        left = np.array([1, 1, 1, 0], dtype=np.int16)
-
-        pred = intra_dc_predict_4x4(top, left)
-        assert np.all(pred == 1)
-
-    def test_dc_4x4_zeros(self):
-        """Test DC prediction with all zeros."""
-        top = np.zeros(4, dtype=np.int16)
-        left = np.zeros(4, dtype=np.int16)
-
-        pred = intra_dc_predict_4x4(top, left)
-
-        assert np.all(pred == 0)
+        assert np.all(pred == expected)
 
 
 class TestDCPredictGeneral:

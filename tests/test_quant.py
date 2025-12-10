@@ -7,6 +7,7 @@ across different QP values and block sizes.
 """
 
 import numpy as np
+import pytest
 
 from nano_hevc.quant import (
     quantize,
@@ -184,28 +185,13 @@ class TestRoundTrip:
 class TestBlockSizes:
     """Tests for different block sizes."""
 
-    def test_quantize_8x8(self):
-        """Test 8x8 block quantization."""
-        coeff = np.random.randint(-200, 200, size=(8, 8), dtype=np.int32)
-        level = quantize(coeff, qp=20, size=8)
+    @pytest.mark.parametrize("size", [8, 16, 32])
+    def test_quantize_block_sizes(self, size):
+        """Quantization should work for multiple block sizes."""
+        coeff = np.random.randint(-200, 200, size=(size, size), dtype=np.int32)
+        level = quantize(coeff, qp=20, size=size)
 
-        assert level.shape == (8, 8)
-        assert level.dtype == np.int32
-
-    def test_quantize_16x16(self):
-        """Test 16x16 block quantization."""
-        coeff = np.random.randint(-200, 200, size=(16, 16), dtype=np.int32)
-        level = quantize(coeff, qp=20, size=16)
-
-        assert level.shape == (16, 16)
-        assert level.dtype == np.int32
-
-    def test_quantize_32x32(self):
-        """Test 32x32 block quantization."""
-        coeff = np.random.randint(-200, 200, size=(32, 32), dtype=np.int32)
-        level = quantize(coeff, qp=20, size=32)
-
-        assert level.shape == (32, 32)
+        assert level.shape == (size, size)
         assert level.dtype == np.int32
 
 
@@ -252,6 +238,24 @@ class TestUtilities:
 
         assert is_all_zero(zeros)
         assert not is_all_zero(nonzeros)
+
+
+class TestQPSensitivity:
+    """Behavior across different QP values."""
+
+    def test_qp_step_halves_every_six(self):
+        """
+        Increasing QP by 6 should roughly halve coefficient magnitude.
+        Uses a stable DC-heavy block to make the comparison robust.
+        """
+        coeff = np.full((4, 4), 256, dtype=np.int32)
+
+        level_low = quantize(coeff, qp=10, size=4)
+        level_high = quantize(coeff, qp=16, size=4)  # +6 QP
+
+        # Non-zero count should not increase and magnitudes should drop
+        assert count_nonzero(level_high) <= count_nonzero(level_low)
+        assert np.abs(level_high[0, 0]) * 2 <= np.abs(level_low[0, 0]) + 1
 
 
 class TestIntraVsInter:

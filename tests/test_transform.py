@@ -54,33 +54,49 @@ class TestTransformMatrices:
 class TestForwardTransform:
     """Tests for forward transform."""
 
-    def test_forward_4x4_zeros(self):
-        """Zero input should produce zero output."""
-        residual = np.zeros((4, 4), dtype=np.int16)
-        coeff = forward_transform_4x4(residual)
+    @pytest.mark.parametrize("size,use_dst", [(4, False), (8, False), (4, True)])
+    def test_forward_zeros(self, size, use_dst):
+        """Zero input should always map to zero coefficients."""
+        residual = np.zeros((size, size), dtype=np.int16)
+        coeff = forward_transform(residual, use_dst=use_dst)
 
-        assert coeff.shape == (4, 4)
+        assert coeff.shape == (size, size)
         assert np.all(coeff == 0)
 
     def test_forward_4x4_dc_only(self):
-        """Uniform block should produce DC coefficient only."""
+        """Uniform block should concentrate energy in DC."""
         residual = np.full((4, 4), 16, dtype=np.int16)
         coeff = forward_transform_4x4(residual)
 
-        # DC coefficient (top-left) should be non-zero
-        assert coeff[0, 0] != 0
-        # AC coefficients should be zero or very small
-        ac_coeff = coeff.copy()
-        ac_coeff[0, 0] = 0
-        assert np.max(np.abs(ac_coeff)) < np.abs(coeff[0, 0]) * 0.1
+        # DC coefficient (top-left) should dominate
+        dc = coeff[0, 0]
+        ac = coeff.copy()
+        ac[0, 0] = 0
+        assert dc != 0
+        assert np.max(np.abs(ac)) <= np.abs(dc) * 0.05
 
-    def test_forward_8x8_zeros(self):
-        """Zero input should produce zero output."""
-        residual = np.zeros((8, 8), dtype=np.int16)
-        coeff = forward_transform_8x8(residual)
+    def test_forward_matches_reference_multiply(self):
+        """
+        Forward transform should match explicit T @ X @ T.T implementation.
+        This guards against shift/scaling regressions in the two-pass loops.
+        """
+        residual = np.array([
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 0, -1, -2],
+            [4, 3, 2, 1],
+        ], dtype=np.int16)
 
-        assert coeff.shape == (8, 8)
-        assert np.all(coeff == 0)
+        # Reference using the same scaling rule as the implementation
+        T = DCT4.astype(np.int64)
+        log2_size = 2
+        shift = log2_size + 5
+        rnd = 1 << (shift - 1)
+        temp = ((T @ residual.astype(np.int64)) + rnd) >> shift
+        ref = ((temp @ T.T) + rnd) >> shift
+
+        coeff = forward_transform_4x4(residual, use_dst=False)
+        assert np.allclose(coeff, ref, atol=1)
 
     def test_forward_dst_vs_dct(self):
         """DST and DCT should produce different results."""
