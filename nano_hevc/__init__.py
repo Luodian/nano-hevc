@@ -39,6 +39,13 @@ from nano_hevc.quant import (
     QUANT_SCALE,
     DEQUANT_SCALE,
 )
+from nano_hevc.metrics import (
+    psnr,
+    mse,
+    sad,
+    satd_4x4,
+    residual_energy,
+)
 
 __all__ = [
     "Plane",
@@ -73,4 +80,9 @@ __all__ = [
     "dequantize_block",
     "QUANT_SCALE",
     "DEQUANT_SCALE",
+    "psnr",
+    "mse",
+    "sad",
+    "satd_4x4",
+    "residual_energy",
 ]

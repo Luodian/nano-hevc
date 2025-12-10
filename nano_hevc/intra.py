@@ -106,8 +106,8 @@ def intra_planar_predict(
 
     for y in range(size):
         for x in range(size):
-            h = (size - 1 - x) * left[y] + (x + 1) * top_right
-            v = (size - 1 - y) * top[x] + (y + 1) * bottom_left
+            h = (size - 1 - x) * int(left[y]) + (x + 1) * top_right
+            v = (size - 1 - y) * int(top[x]) + (y + 1) * bottom_left
             pred[y, x] = (h + v + size) >> (log2_size + 1)
 
     return pred
