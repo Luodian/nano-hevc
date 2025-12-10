@@ -16,7 +16,6 @@ from __future__ import annotations
 import numpy as np
 
 
-# HEVC 4x4 DST-VII matrix (used for 4x4 luma intra)
 # Spec Table 8-9
 DST4 = np.array([
     [ 29,  55,  74,  84],
@@ -25,7 +24,6 @@ DST4 = np.array([
     [ 55, -84,  74, -29],
 ], dtype=np.int32)
 
-# HEVC 4x4 DCT-II matrix
 # Spec Table 8-8
 DCT4 = np.array([
     [ 64,  64,  64,  64],
@@ -34,7 +32,6 @@ DCT4 = np.array([
     [ 36, -83,  83, -36],
 ], dtype=np.int32)
 
-# HEVC 8x8 DCT-II matrix
 DCT8 = np.array([
     [ 64,  64,  64,  64,  64,  64,  64,  64],
     [ 89,  75,  50,  18, -18, -50, -75, -89],
@@ -46,7 +43,6 @@ DCT8 = np.array([
     [ 18, -50,  75, -89,  89, -75,  50, -18],
 ], dtype=np.int32)
 
-# HEVC 16x16 DCT-II matrix
 DCT16 = np.array([
     [ 64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64],
     [ 90,  87,  80,  70,  57,  43,  25,   9,  -9, -25, -43, -57, -70, -80, -87, -90],
@@ -66,11 +62,8 @@ DCT16 = np.array([
     [  9, -25,  43, -57,  70, -80,  87, -90,  90, -87,  80, -70,  57, -43,  25,  -9],
 ], dtype=np.int32)
 
-# HEVC 32x32 DCT-II matrix (only even rows shown, odd rows follow pattern)
-# For brevity, we generate it from the basis functions
 def _generate_dct32() -> np.ndarray:
-    """Generate 32x32 DCT matrix from HEVC coefficients."""
-    # HEVC 32-point DCT coefficients (Table 8-8)
+    """Spec Table 8-8."""
     c = [
         [ 64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,
           64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64],
@@ -177,35 +170,28 @@ def forward_transform(residual: np.ndarray, use_dst: bool = False) -> np.ndarray
     """
     size = residual.shape[0]
     T = _get_transform_matrix(size, use_dst)
-
-    # Size-dependent shift for proper scaling
-    # HEVC uses shift = log2(size) + 5 for forward transform passes
     log2_size = int(np.log2(size))
-    shift1 = log2_size + 5
-    rnd1 = 1 << (shift1 - 1)
-
-    # Convert to int32 for intermediate calculations
+    shift = log2_size + 5
+    rnd = 1 << (shift - 1)
     block = residual.astype(np.int32)
 
-    # First pass: transform rows (T @ block)
+    # First pass: rows
     temp = np.zeros((size, size), dtype=np.int32)
     for i in range(size):
         for j in range(size):
             acc = 0
             for k in range(size):
                 acc += T[i, k] * block[k, j]
-            temp[i, j] = (acc + rnd1) >> shift1
+            temp[i, j] = (acc + rnd) >> shift
 
-    # Second pass: transform columns (temp @ T.T)
-    shift2 = shift1
-    rnd2 = 1 << (shift2 - 1)
+    # Second pass: columns
     coeff = np.zeros((size, size), dtype=np.int32)
     for i in range(size):
         for j in range(size):
             acc = 0
             for k in range(size):
-                acc += temp[i, k] * T[j, k]  # T.T[k,j] = T[j,k]
-            coeff[i, j] = (acc + rnd2) >> shift2
+                acc += temp[i, k] * T[j, k]
+            coeff[i, j] = (acc + rnd) >> shift
 
     return coeff
 
@@ -226,34 +212,28 @@ def inverse_transform(coeff: np.ndarray, use_dst: bool = False) -> np.ndarray:
     """
     size = coeff.shape[0]
     T = _get_transform_matrix(size, use_dst)
-
-    # Size-dependent shift matching forward transform
     log2_size = int(np.log2(size))
-    shift1 = log2_size + 5
-    rnd1 = 1 << (shift1 - 1)
-
-    # Convert to int32
+    shift = log2_size + 5
+    rnd = 1 << (shift - 1)
     block = coeff.astype(np.int32)
 
-    # First pass: T.T @ coefficients (columns)
+    # First pass: columns
     temp = np.zeros((size, size), dtype=np.int32)
     for i in range(size):
         for j in range(size):
             acc = 0
             for k in range(size):
-                acc += T[k, i] * block[k, j]  # T.T[i,k] = T[k,i]
-            temp[i, j] = (acc + rnd1) >> shift1
+                acc += T[k, i] * block[k, j]
+            temp[i, j] = (acc + rnd) >> shift
 
-    # Second pass: temp @ T (rows)
-    shift2 = shift1
-    rnd2 = 1 << (shift2 - 1)
+    # Second pass: rows
     residual = np.zeros((size, size), dtype=np.int32)
     for i in range(size):
         for j in range(size):
             acc = 0
             for k in range(size):
                 acc += temp[i, k] * T[k, j]
-            residual[i, j] = (acc + rnd2) >> shift2
+            residual[i, j] = (acc + rnd) >> shift
 
     return residual
 

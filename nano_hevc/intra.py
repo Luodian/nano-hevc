@@ -20,9 +20,7 @@ from __future__ import annotations
 import numpy as np
 
 
-# HEVC spec Table 8-4: intraPredAngle for modes 2-34
-# Index 0-32 maps to modes 2-34
-# Angle in 1/32 pixel units
+# Spec Table 8-4: angle in 1/32 pixel units
 INTRA_PRED_ANGLE = [
     32, 26, 21, 17, 13, 9, 5, 2, 0,      # modes 2-10
     -2, -5, -9, -13, -17, -21, -26, -32, # modes 11-17
@@ -30,8 +28,6 @@ INTRA_PRED_ANGLE = [
     2, 5, 9, 13, 17, 21, 26, 32          # modes 26-34 (note: 26 starts new)
 ]
 
-# Inverse angles for reference sample extension (when angle < 0)
-# invAngle = round(256 * 32 / angle) for negative angles
 INV_ANGLE = {
     -2: -4096, -5: -1638, -9: -910, -13: -630,
     -17: -482, -21: -390, -26: -315, -32: -256
@@ -144,20 +140,14 @@ def intra_angular_predict(
     """
     pred = np.empty((size, size), dtype=np.int16)
     angle = INTRA_PRED_ANGLE[mode - 2]
-
-    # Modes 2-17 are horizontal-like, modes 18-34 are vertical-like
     is_vertical = mode >= 18
 
     if is_vertical:
-        # Vertical modes: project onto top reference
-        # For pixel (x, y): ref position = x + 1 + ((y+1)*angle >> 5)
         ref = _build_ref_array(top, left, top_left, angle, size)
         for y in range(size):
             for x in range(size):
                 pred[y, x] = _project_sample_at(ref, x, y, angle, size)
     else:
-        # Horizontal modes: project onto left reference
-        # For pixel (x, y): ref position = y + 1 + ((x+1)*angle >> 5)
         ref = _build_ref_array(left, top, top_left, angle, size)
         for y in range(size):
             for x in range(size):
@@ -175,22 +165,11 @@ def _build_ref_array(
 ) -> np.ndarray:
     """
     Build 1D reference array for angular prediction.
-
-    For vertical modes: primary=top, secondary=left
-    For horizontal modes: primary=left, secondary=top
-
-    The reference array is indexed from -size to 2*size.
-    Index 0 corresponds to the corner pixel.
-    Positive indices are the primary reference.
-    Negative indices are extended from secondary (when angle < 0).
+    ref[i + size] accesses logical index i, range [-size, 2*size].
     """
-    # Allocate reference array: indices -size to 2*size
-    # We use offset indexing: ref[i + size] accesses logical index i
     ref = np.zeros(3 * size + 1, dtype=np.int16)
     offset = size
 
-    # Copy primary reference (indices 1 to 2*size)
-    # primary[0] is corner, primary[1..2*size] are the reference pixels
     ref[offset] = corner
     for i in range(1, 2 * size + 1):
         if i < len(primary):
@@ -198,13 +177,10 @@ def _build_ref_array(
         else:
             ref[offset + i] = primary[-1]
 
-    # Extend with secondary reference when angle is negative
     if angle < 0:
         inv_angle = INV_ANGLE[angle]
-        # Number of samples to extend
         num_extend = (size * angle) >> 5
         for i in range(-1, num_extend - 1, -1):
-            # Project back to secondary reference
             proj = ((i + 1) * inv_angle + 128) >> 8
             if proj < len(secondary):
                 ref[offset + i] = secondary[proj]
@@ -219,39 +195,13 @@ def _project_sample_at(
     angle: int,
     size: int
 ) -> int:
-    """
-    Project a sample position onto reference array and interpolate.
-
-    For vertical modes: base=x (column), scan=y (row)
-    For horizontal modes: base=y (row), scan=x (column)
-
-    Args:
-        ref: reference array with offset indexing (ref[i + size] = logical i)
-        base: base position in reference (column for vertical, row for horizontal)
-        scan: scan position that determines angle offset
-        angle: prediction angle in 1/32 units
-        size: block size (used as offset)
-
-    Returns:
-        Interpolated pixel value
-    """
+    """Project sample onto reference array with linear interpolation."""
     offset = size
-
-    # Calculate projection offset: (scan + 1) * angle
-    # Result is in 1/32 pixel units
     proj = (scan + 1) * angle
-
-    # Integer and fractional parts
     int_part = proj >> 5
     frac = proj & 31
-
-    # Reference position: base + 1 + integer offset
     ref_idx = offset + base + 1 + int_part
 
     if frac == 0:
         return ref[ref_idx]
-    else:
-        # Linear interpolation: (32 - frac) * ref[i] + frac * ref[i+1]
-        return (
-            (32 - frac) * ref[ref_idx] + frac * ref[ref_idx + 1] + 16
-        ) >> 5
+    return ((32 - frac) * ref[ref_idx] + frac * ref[ref_idx + 1] + 16) >> 5

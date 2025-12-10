@@ -17,13 +17,8 @@ from __future__ import annotations
 import numpy as np
 
 
-# HEVC quantization scaling factors (Table 8-10)
-# Index = QP % 6, used with shift = QP // 6
-# These are the "MF" (multiplication factor) values for forward quant
+# HEVC spec Table 8-10
 QUANT_SCALE = [26214, 23302, 20560, 18396, 16384, 14564]
-
-# HEVC dequantization scaling factors
-# Index = QP % 6, used with shift = QP // 6
 DEQUANT_SCALE = [40, 45, 51, 57, 64, 72]
 
 
@@ -74,27 +69,14 @@ def quantize(
     """
     qp_per, qp_rem = get_qp_params(qp)
     mf = QUANT_SCALE[qp_rem]
-
-    # Shift includes QP scaling and block size normalization
     log2_size = int(np.log2(size))
     shift = 14 + qp_per + log2_size
+    offset = (1 << shift) // 3 if is_intra else (1 << shift) // 6
 
-    # Dead zone offset: intra uses 1/3, inter uses 1/6 of range
-    # This affects how aggressively small coefficients are zeroed
-    if is_intra:
-        offset = (1 << shift) // 3
-    else:
-        offset = (1 << shift) // 6
-
-    # Quantize with sign preservation
     sign = np.sign(coeff)
     abs_coeff = np.abs(coeff).astype(np.int64)
-
-    # Forward quantization: (|c| * MF + offset) >> shift
     level = (abs_coeff * mf + offset) >> shift
-    level = (sign * level).astype(np.int32)
-
-    return level
+    return (sign * level).astype(np.int32)
 
 
 def dequantize(
@@ -129,21 +111,14 @@ def dequantize(
     """
     qp_per, qp_rem = get_qp_params(qp)
     scale = DEQUANT_SCALE[qp_rem]
-
     level = level.astype(np.int64)
-
-    # Scale factor is scale * 16 = scale << 4
     base = level * scale
 
     if qp_per < 4:
-        # For small QP: shift right with rounding
         shift = 4 - qp_per
-        offset = 1 << (shift - 1)
-        coeff = (base + offset) >> shift
+        coeff = (base + (1 << (shift - 1))) >> shift
     else:
-        # For large QP: shift left (amplify)
-        shift = qp_per - 4
-        coeff = base << shift
+        coeff = base << (qp_per - 4)
 
     return coeff.astype(np.int32)
 
@@ -189,7 +164,6 @@ def estimate_bits(level: np.ndarray) -> int:
         estimated bits
     """
     abs_level = np.abs(level)
-    # Each non-zero level needs roughly log2(|level|) + overhead bits
     bits = np.sum(np.log2(abs_level + 1) + (abs_level > 0) * 2)
     return int(bits)
 
