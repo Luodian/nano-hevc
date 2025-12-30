@@ -1,22 +1,30 @@
 """
 Block view abstraction for accessing rectangular regions of a plane.
+
+Uses __slots__ for reduced memory overhead when iterating over many blocks.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Iterator
 import numpy as np
 
 from nano_hevc.frame import Plane
 
 
-@dataclass
 class BlockView:
-    """A view into a rectangular block within a Plane (no data copy)."""
-    plane: Plane
-    x: int
-    y: int
-    size: int
+    """
+    A view into a rectangular block within a Plane (no data copy).
+
+    Uses __slots__ to reduce memory overhead, which is important when
+    creating many BlockView instances during block iteration.
+    """
+    __slots__ = ('plane', 'x', 'y', 'size')
+
+    def __init__(self, plane: Plane, x: int, y: int, size: int):
+        self.plane = plane
+        self.x = x
+        self.y = y
+        self.size = size
 
     @property
     def pixels(self) -> np.ndarray:
@@ -53,8 +61,11 @@ class BlockView:
         self.plane.data[self.y:self.y + self.size,
                         self.x:self.x + self.size] = data
 
+    def __repr__(self) -> str:
+        return f"BlockView(x={self.x}, y={self.y}, size={self.size})"
 
-def iterate_blocks(plane: Plane, block_size: int):
+
+def iterate_blocks(plane: Plane, block_size: int) -> Iterator[BlockView]:
     """Iterate over all non-overlapping blocks in a plane."""
     for y in range(0, plane.height, block_size):
         for x in range(0, plane.width, block_size):
