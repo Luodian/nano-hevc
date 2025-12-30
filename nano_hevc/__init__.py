@@ -2,8 +2,8 @@
 
 __version__ = "0.1.0"
 
-from nano_hevc.frame import Plane, Frame
-from nano_hevc.block import BlockView
+from nano_hevc.frame import Plane, Frame, PackedFrame, FrameBufferPool
+from nano_hevc.block import BlockView, iterate_blocks
 from nano_hevc.intra import (
     INTRA_PRED_ANGLE,
     intra_dc_predict_4x4,
@@ -50,7 +50,10 @@ from nano_hevc.metrics import (
 __all__ = [
     "Plane",
     "Frame",
+    "PackedFrame",
+    "FrameBufferPool",
     "BlockView",
+    "iterate_blocks",
     "INTRA_PRED_ANGLE",
     "intra_dc_predict_4x4",
     "intra_dc_predict",
