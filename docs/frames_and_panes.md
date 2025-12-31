@@ -16,77 +16,17 @@ nano-hevc 这个项目的目标不仅仅是实现算法的 pseudocode 式模拟�
 
 以一张 RGB 图像为例，每个像素有 R、G、B 三个值。这三个值在内存中怎么排列？有两种截然不同的策略。
 
-用一个 2×2 的小图来说明：
-
-<!-- Image prompt for nano-banana (google/gemini-3-pro-image-preview):
-A futuristic 3D FRONT-FACING technical pixel grid visualization in sleek glassmorphism style, clean white background with HIGH CONTRAST elements.
-
-Main structure: a floating 2x2 grid of four large semi-transparent frosted glass square tiles arranged in perfect square formation, viewed from DIRECT FRONT ANGLE (not isometric). Each tile has BOLD glowing cyan beveled edges with strong contrast and defined inner shadows.
-
-Inside each tile, three VIBRANT SATURATED glowing spheres clustered in triangular arrangement: a BRIGHT RED sphere labeled R in bold black text, a VIVID GREEN sphere labeled G, a DEEP BLUE sphere labeled B. Spheres have strong glossy reflections and intense colored light halos.
-
-Floating holographic row indicators on right: Row 0 for top row, Row 1 for bottom row, with BOLD glowing horizontal guide lines in bright cyan.
-
-Floating holographic column indicators at bottom: Col 0 below left column, Col 1 below right column, with BOLD glowing vertical guide lines.
-
-Top floating glass title plate with DARK BACKGROUND: PIXEL LAYOUT (Logical View) in bold WHITE text with high contrast.
-
-Coordinate labels at tile corners in BOLD DARK CYAN text: (0,0) top-left, (0,1) top-right, (1,0) bottom-left, (1,1) bottom-right.
-
-Clean grid lines, strong shadows, HIGH CONTRAST colors, high-tech minimalist aesthetic. 4K resolution, ultra detailed, sharp edges.
--->
+这里我们用一个 2×2 的小图来展示两种不同的存储方式：
 
 ![像素布局（逻辑视角）](./assets/pixel_layout.png)
 
-HWC 格式下，内存中的实际排列是按「像素优先」的顺序，先存完一个像素的所有通道，再存下一个像素：
-
-<!-- Image prompt for nano-banana (google/gemini-3-pro-image-preview):
-A futuristic 3D FRONT-FACING technical memory layout visualization in sleek glassmorphism style, clean white background with HIGH CONTRAST elements.
-
-Main structure: a horizontal strip of 12 semi-transparent frosted glass rectangular cells arranged in a single row, viewed from DIRECT FRONT ANGLE (not isometric). Each cell has BOLD glowing cyan beveled edges with strong contrast.
-
-Inside cells, VIBRANT SATURATED glowing spheres showing HWC (Height-Width-Channel) interleaved memory order:
-- Cells 0-2: BRIGHT RED, VIVID GREEN, DEEP BLUE spheres labeled R00 G00 B00 in bold black text (pixel 0,0)
-- Cells 3-5: BRIGHT RED, VIVID GREEN, DEEP BLUE spheres labeled R01 G01 B01 (pixel 0,1)
-- Cells 6-8: BRIGHT RED, VIVID GREEN, DEEP BLUE spheres labeled R10 G10 B10 (pixel 1,0)
-- Cells 9-11: BRIGHT RED, VIVID GREEN, DEEP BLUE spheres labeled R11 G11 B11 (pixel 1,1)
-
-Below each group of 3 cells, floating holographic bracket labels in BOLD DARK text: Pixel(0,0), Pixel(0,1), Pixel(1,0), Pixel(1,1).
-
-Top floating address bar showing: Memory Address: 0 1 2 3 4 5 6 7 8 9 10 11 in BOLD DARK CYAN text.
-
-Top title plate with DARK BACKGROUND: HWC FORMAT (Packed/Interleaved) in bold WHITE text with high contrast.
-
-Clean lines, strong shadows, HIGH CONTRAST colors, high-tech minimalist aesthetic. 4K resolution, ultra detailed, sharp edges.
--->
+HWC 格式下，内存中的实际排列是按「像素优先」的顺序，先存完一个像素的所有通道，再存下一个像素。
 
 ![HWC 内存布局](./assets/hwc_memory_layout.png)
 
 HWC（又称 Packed 或 Interleaved）格式按「像素优先」存储：先存完一个像素的所有通道，再存下一个像素。这种布局的好处是什么？访问单个像素的全部通道时，数据在内存中紧挨着，cache 友好。图像渲染、显示输出等场景经常需要同时读取一个位置的所有通道，所以 OpenCV、PIL 等图像库默认使用这种格式。
 
 Planar（又称 CHW）格式则完全不同，它按「通道优先」存储：先存完整个 R 平面，再存完整个 G 平面，最后存 B 平面：
-
-<!-- Image prompt for nano-banana (google/gemini-3-pro-image-preview):
-A futuristic 3D FRONT-FACING technical memory layout visualization in sleek glassmorphism style, clean white background with HIGH CONTRAST elements.
-
-Main structure: a horizontal strip of 12 semi-transparent frosted glass rectangular cells arranged in a single row, viewed from DIRECT FRONT ANGLE (not isometric). Each cell has BOLD glowing cyan beveled edges with strong contrast.
-
-Inside cells, VIBRANT SATURATED glowing spheres showing PLANAR (CHW) channel-first memory order, organized into THREE distinct colored sections:
-
-RED PLANE section (cells 0-3): Four BRIGHT RED glowing spheres labeled R00 R01 R10 R11 in bold black text, with floating bracket below labeled R Plane in BOLD DARK RED text.
-
-GREEN PLANE section (cells 4-7): Four VIVID GREEN glowing spheres labeled G00 G01 G10 G11, with floating bracket below labeled G Plane in BOLD DARK GREEN text.
-
-BLUE PLANE section (cells 8-11): Four DEEP BLUE glowing spheres labeled B00 B01 B10 B11, with floating bracket below labeled B Plane in BOLD DARK BLUE text.
-
-BOLD vertical glowing divider lines separating the three plane sections.
-
-Top floating address bar showing: Memory Address: 0 1 2 3 4 5 6 7 8 9 10 11 in BOLD DARK CYAN text.
-
-Top title plate with DARK BACKGROUND: PLANAR FORMAT (CHW) in bold WHITE text with high contrast.
-
-Clean lines, strong shadows, HIGH CONTRAST colors, high-tech minimalist aesthetic. 4K resolution, ultra detailed, sharp edges.
--->
 
 ![Planar 内存布局](./assets/planar_memory_layout.png)
 
@@ -98,7 +38,7 @@ Clean lines, strong shadows, HIGH CONTRAST colors, high-tech minimalist aestheti
 
 还有一个问题：在 4:2:0 采样下，U/V 平面的尺寸只有 Y 的 1/4（水平和垂直各减半）。如果用交错存储，每 4 个 Y 像素才对应 1 组 UV，数据结构会变得异常复杂。而 Planar 格式下，三个平面各自独立，尺寸不同也毫无问题。
 
-更关键的是，HEVC 的某些高级模式允许 luma 和 chroma 拥有完全不同的四叉树划分结构（这一特性在 H.264 中并不存在）。亮度可以被细分到很小的块（如 4×4），而色度受限于最小变换单元大小，可能维持较大的块结构不再细分。如果 Y/U/V 混在一起存储，这种灵活性就难以实现。
+更关键的是，HEVC 允许 luma 和 chroma 在变换单元（TU）层面拥有不同的划分深度（这一特性在 H.264 中并不存在）。比如同一个 CU 内，Luma 的 TU 可以细分到 4×4，而 Chroma 受限于最小变换单元大小，可能只划分到对应 Luma 8×8 区域的 4×4 块就不再细分了。如果 Y/U/V 混在一起存储，这种灵活性就难以实现。
 
 所以从第一行代码开始，我们就需要把一帧图像拆解为三个正交的二维平面，各自独立、互不干扰。
 
@@ -145,46 +85,15 @@ Python 中每个对象默认都有一个 `__dict__` 属性来存储实例属性�
 
 `__slots__` 的作用就是告诉 Python：「这个类的实例只会有这几个属性，不需要 `__dict__`」。Python 会把属性存储在固定大小的数组里，通过偏移量直接访问，就像 C 的 struct 一样。属性访问从查字典变成按偏移量访问，速度更快，内存占用大幅下降。
 
-拿 `BlockView` 这个有 4 个属性的类来算笔账：
-
-<!-- Image prompt for nano-banana (google/gemini-3-pro-image-preview):
-A futuristic 3D FRONT-FACING technical memory comparison visualization in sleek glassmorphism style, clean white background with HIGH CONTRAST elements.
-
-Main structure: TWO side-by-side vertical stacked memory block diagrams, viewed from DIRECT FRONT ANGLE (not isometric).
-
-LEFT SIDE - "Regular Python Object" (taller, more wasteful):
-A tall vertical stack of semi-transparent frosted glass blocks with BOLD cyan edges:
-- Top block: "PyObject_HEAD" labeled "16 bytes" in BOLD text, colored NEUTRAL GRAY
-- Block 2: "__dict__ pointer" labeled "8 bytes", colored NEUTRAL GRAY
-- Block 3: "__weakref__ pointer" labeled "8 bytes", colored NEUTRAL GRAY
-- Block 4 (LARGE, taking most space): "__dict__ object" labeled "~104 bytes", colored WARNING ORANGE/RED to indicate waste, with small hash table icon inside
-- Bottom summary bar: "Total: ~136 bytes" in BOLD RED text
-Title above: "WITHOUT __slots__" in BOLD DARK text
-
-RIGHT SIDE - "Slots Object" (shorter, efficient):
-A shorter vertical stack of semi-transparent frosted glass blocks with BOLD cyan edges:
-- Top block: "PyObject_HEAD" labeled "16 bytes", colored NEUTRAL GRAY
-- Block 2: "slot[0]: plane" labeled "8 bytes", colored BRIGHT GREEN
-- Block 3: "slot[1]: x" labeled "8 bytes", colored BRIGHT GREEN
-- Block 4: "slot[2]: y" labeled "8 bytes", colored BRIGHT GREEN
-- Block 5: "slot[3]: size" labeled "8 bytes", colored BRIGHT GREEN
-- Bottom summary bar: "Total: 48 bytes" in BOLD GREEN text
-Title above: "WITH __slots__" in BOLD DARK text
-
-Between the two diagrams: A large "65% SAVED" badge in VIBRANT GREEN with checkmark icon.
-
-Arrow pointing from left to right showing the optimization direction.
-
-Top title plate with DARK BACKGROUND: "PYTHON OBJECT MEMORY LAYOUT" in bold WHITE text.
-
-Clean lines, strong shadows, HIGH CONTRAST colors, high-tech minimalist aesthetic. 4K resolution, ultra detailed, sharp edges.
--->
+这里我们可以用 `BlockView` 举例
 
 ![Python 对象内存布局对比](./assets/slots_memory_comparison.png)
 
 实际节省比例因 Python 版本和属性数量而异。属性越少，`__dict__` 的固定开销占比越大，节省比例越高。对于视频压缩这种需要创建几万个 `BlockView` 对象的场景，这个优化效果相当可观。
 
 另一个细节是 `zeros` 工厂方法中的 `order='C'`。NumPy 数组有两种内存布局：C order（行优先）和 Fortran order（列优先）。视频编码通常按行扫描处理数据，所以 C order 能获得更好的 cache locality。这个参数容易被忽略，但在大规模数据处理中，cache 命中率的差异可能带来显著的性能差距。
+
+顺便提一下，nano-hevc 的 `Plane` 实现假设图像数据是紧凑排列的（width × height）。但在真实的工业级编码器（如 x265、FFmpeg）中，为了利用 SIMD 指令集（AVX2/NEON）加速，每一行像素通常需要内存对齐（比如对齐到 32 或 64 字节）。这时候就需要引入 `stride`（跨度）的概念：`stride` 表示相邻两行之间的字节偏移，可能大于 `width`。
 
 ### Frame：三个平面的容器
 
@@ -221,7 +130,7 @@ class Frame:
         )
 ```
 
-注意 `zeros` 方法中 U 和 V 平面的尺寸是 Y 的一半。这就是上一篇文章提到的 4:2:0 采样：色度分辨率在水平和垂直方向各减半，总数据量只有 Y 的 1/4。三个平面加起来，数据量是 Y 的 1.5 倍，相比 RGB 格式的 3 倍数据量减少了 50%。
+这里我们需要注意 `zeros` 方法中 U 和 V 平面的尺寸是 Y 的一半。也就是上一篇文章提到的 4:2:0 采样：色度分辨率在水平和垂直方向各减半，总数据量只有 Y 的 1/4。三个平面加起来，数据量是 Y 的 1.5 倍，相比 RGB 格式的 3 倍数据量减少了 50%。
 
 `from_yuv420p` 方法展示了如何从原始字节流构建 Frame。YUV420p 这个名字怎么理解？拆开来看：YUV 表示颜色空间（Y 是亮度，U/V 是色度）；420 是色度采样格式（4:2:0 表示每 4 个亮度像素共享 1 组色度值，色度在水平和垂直方向都是亮度的一半）；p 代表 planar（平面式），表示 Y/U/V 三个通道分开存储。
 
@@ -249,13 +158,13 @@ for plane_name, src_plane, dst_plane in [
 
 ### 🚀 进阶：PackedFrame 与内存池
 
-其实上面的 `Frame` 实现已经足够教学使用了。但如果需要进一步优化性能，nano-hevc 还提供了两个高级抽象。
+其实上面的 `Frame` 实现已经足够教学使用了。但如果需要进一步优化性能，我们还可以进一步的做些设计。
 
 #### PackedFrame：单次内存分配
 
 普通 Frame 创建三个独立的 NumPy 数组，意味着三次内存分配。每次 `np.zeros()` 都可能触发一次 `malloc()` 系统调用，分配器还要维护内存块的元数据。
 
-PackedFrame 的思路很简单：既然我们知道 Y/U/V 的总大小，为什么不一次性分配一块连续内存，然后用 view 切出三个平面？
+升级为 PackedFrame 的思路很简单：既然我们知道 Y/U/V 的总大小，为什么不一次性分配一块连续内存，然后用 view 切出三个平面？
 
 ```python
 class PackedFrame:
@@ -278,9 +187,9 @@ class PackedFrame:
 
 #### FrameBufferPool：对象池模式
 
-比减少内存分配更有效的优化是什么？完全避免分配。
+当然我们还可以继续思考，比减少内存分配更有效的优化是什么？其实还可以完全避免分配。
 
-视频编码器有一个特点：它会反复处理相同分辨率的帧。每一帧都分配新 buffer，处理完又释放，这种 malloc/free 的开销完全是浪费。
+因为视频编码器有一个特点：它会反复处理相同分辨率的帧。每一帧都分配新 buffer，处理完又释放，那这个时候这种 malloc/free 的开销就是被浪费的。
 
 对象池（Object Pool）模式的思路很简单：预先分配一批 buffer，需要时从池中取，用完放回。这样内存分配只发生在初始化阶段，后续编码过程中完全避免了系统调用。
 
@@ -291,9 +200,7 @@ idx, frame = pool.acquire()  # 从池中获取
 pool.release(idx)  # 归还到池中
 ```
 
-这个模式在工业级编码器中非常常见，x264、x265 等主流编码器都有类似的 buffer 管理机制。nano-hevc 提供了一个简化版本，帮助理解设计思路。
-
-当需要处理 4K 60fps 的视频流时，这些优化累积起来可能会对整体性能产生决定性影响。（主包计划最后尝试一下真正去编码 4K 60fps 的视频流🐱）
+这个模式在工业级编码器中非常常见，x264、x265 等主流编码器都有类似的 buffer 管理机制。nano-hevc 提供了一个简化版本，帮助理解设计思路。当需要处理 4K 60fps 的视频流时，这些优化累积起来可能会对整体性能产生决定性影响。（主包计划最后尝试一下真正去编码 4K 60fps 的视频流🐱）
 
 ## ⚠️ 存储格式 vs 计算格式
 
@@ -372,6 +279,8 @@ class BlockView:
 
 这样一来，函数签名从 `process_block(data, x, y, size)` 简化为 `process_block(blk)`，边界处理也被封装在 `get_top_neighbors()` 内部。调用方不用关心当前块是否在图像边缘。
 
+这里用 128 作为边界默认值是一个简化处理。HEVC 标准的参考像素填充逻辑其实更复杂：如果 Top 不存在但 Left 存在，会用 Left 的最上像素去填充；只有当 Top 和 Left 都不存在（比如第一帧的第一个块）时，才 fallback 到 `1 << (bit_depth - 1)`（8 bit 下即 128）。对于教学项目，直接用 128 可以接受，但严格实现时需要补全这套逻辑。
+
 遍历所有块也变得很简洁：
 
 ```python
@@ -427,6 +336,8 @@ recon_coeff = dequantize_block(levels, qp=22)
 recon_residual = inverse_transform(recon_coeff, use_dst=is_4x4_luma_intra)
 recon = np.clip(pred + recon_residual, 0, 255).astype(np.uint8)  # 重建块，必须 clip
 ```
+
+为什么 4×4 Intra 要用 DST 而不是 DCT？这是 HEVC 相比 H.264 的一个改进。Intra 预测的残差有一个特点：靠近参考边界的地方残差通常较小（因为预测更准），离边界越远残差越大。这种「从边界逐渐增大」的形态恰好接近正弦波的半周期，所以 DST 比 DCT 能更高效地压缩能量。但这个效果在大块上不那么明显，所以 HEVC 只对 4×4 Luma Intra 启用 DST。
 
 这里的 `np.clip` 是本质性的步骤，绝对不能省略。预测值和重建残差相加后，结果很可能超出 `[0, 255]` 范围：比如 `pred = 250`，`recon_residual = 20`，加起来就是 270。如果不做 clip，后续块用这个「溢出」的值做预测参考，错误会沿着扫描方向传播到整帧，最终产生严重的色块。
 
