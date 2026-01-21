@@ -46,6 +46,19 @@ from nano_hevc.metrics import (
     satd_4x4,
     residual_energy,
 )
+from nano_hevc.scan import (
+    scan_block,
+    inverse_scan_block,
+    get_scan_order,
+    get_scan_type_for_intra_mode,
+    SCAN_DIAG,
+    SCAN_HOR,
+    SCAN_VER,
+)
+from nano_hevc.bitstream import BitstreamWriter
+from nano_hevc.cabac import CabacEncoder, CabacContext, init_contexts_for_slice
+from nano_hevc.nal import HEVCConfig, create_parameter_sets
+from nano_hevc.encoder import encode_frame, encode_video
 
 __all__ = [
     "Plane",
@@ -88,4 +101,19 @@ __all__ = [
     "sad",
     "satd_4x4",
     "residual_energy",
+    "scan_block",
+    "inverse_scan_block",
+    "get_scan_order",
+    "get_scan_type_for_intra_mode",
+    "SCAN_DIAG",
+    "SCAN_HOR",
+    "SCAN_VER",
+    "BitstreamWriter",
+    "CabacEncoder",
+    "CabacContext",
+    "init_contexts_for_slice",
+    "HEVCConfig",
+    "create_parameter_sets",
+    "encode_frame",
+    "encode_video",
 ]

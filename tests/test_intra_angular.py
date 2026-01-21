@@ -76,12 +76,15 @@ class TestAngularVertical:
         left = np.array([0, 5, 5, 5, 5, 5, 5, 5, 5], dtype=np.int16)
         pred = intra_angular_predict(top, left, top_left=0, mode=18, size=size)
 
-        expected = np.array([
-            [0, 10, 20, 30],
-            [0,  0, 10, 20],
-            [5,  0,  0, 10],
-            [5,  5,  0,  0],
-        ], dtype=np.int16)
+        expected = np.array(
+            [
+                [0, 10, 20, 30],
+                [5, 0, 10, 20],
+                [5, 5, 0, 10],
+                [5, 5, 5, 0],
+            ],
+            dtype=np.int16,
+        )
         assert np.array_equal(pred, expected)
 
 
@@ -190,11 +193,11 @@ class TestAngularAllModes:
     def test_angle_table_correctness(self):
         """Verify the angle table matches expected values."""
         # Key mode-angle pairs from HEVC spec
-        assert INTRA_PRED_ANGLE[10 - 2] == 0   # Mode 10: horizontal
-        assert INTRA_PRED_ANGLE[26 - 2] == 0   # Mode 26: vertical
-        assert INTRA_PRED_ANGLE[2 - 2] == 32   # Mode 2: 45 degrees
+        assert INTRA_PRED_ANGLE[10 - 2] == 0  # Mode 10: horizontal
+        assert INTRA_PRED_ANGLE[26 - 2] == 0  # Mode 26: vertical
+        assert INTRA_PRED_ANGLE[2 - 2] == 32  # Mode 2: 45 degrees
         assert INTRA_PRED_ANGLE[34 - 2] == 32  # Mode 34: 45 degrees
-        assert INTRA_PRED_ANGLE[18 - 2] == -32 # Mode 18: diagonal
+        assert INTRA_PRED_ANGLE[18 - 2] == -32  # Mode 18: diagonal
 
 
 class TestAngularBlockSizes:
@@ -238,12 +241,15 @@ class TestAngularIntegration:
         left = np.array([100, 100, 100, 100, 100, 100, 100, 100, 100], dtype=np.int16)
         top_left = 100
 
-        orig = np.array([
-            [102, 101, 100, 100],
-            [103, 102, 101, 100],
-            [103, 102, 100,  99],
-            [104, 101,  99,  98],
-        ], dtype=np.int16)
+        orig = np.array(
+            [
+                [102, 101, 100, 100],
+                [103, 102, 101, 100],
+                [103, 102, 100, 99],
+                [104, 101, 99, 98],
+            ],
+            dtype=np.int16,
+        )
 
         pred = intra_angular_predict(top, left, top_left, mode=26, size=size)
         assert np.all(pred == 100)

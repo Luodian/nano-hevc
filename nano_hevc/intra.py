@@ -22,15 +22,50 @@ import numpy as np
 
 # Spec Table 8-4: angle in 1/32 pixel units
 INTRA_PRED_ANGLE = [
-    32, 26, 21, 17, 13, 9, 5, 2, 0,      # modes 2-10
-    -2, -5, -9, -13, -17, -21, -26, -32, # modes 11-17
-    -26, -21, -17, -13, -9, -5, -2, 0,   # modes 18-25 (note: 18 starts new)
-    2, 5, 9, 13, 17, 21, 26, 32          # modes 26-34 (note: 26 starts new)
+    32,
+    26,
+    21,
+    17,
+    13,
+    9,
+    5,
+    2,
+    0,  # modes 2-10
+    -2,
+    -5,
+    -9,
+    -13,
+    -17,
+    -21,
+    -26,
+    -32,  # modes 11-17
+    -26,
+    -21,
+    -17,
+    -13,
+    -9,
+    -5,
+    -2,
+    0,  # modes 18-25 (note: 18 starts new)
+    2,
+    5,
+    9,
+    13,
+    17,
+    21,
+    26,
+    32,  # modes 26-34 (note: 26 starts new)
 ]
 
 INV_ANGLE = {
-    -2: -4096, -5: -1638, -9: -910, -13: -630,
-    -17: -482, -21: -390, -26: -315, -32: -256
+    -2: -4096,
+    -5: -1638,
+    -9: -910,
+    -13: -630,
+    -17: -482,
+    -21: -390,
+    -26: -315,
+    -32: -256,
 }
 
 
@@ -79,11 +114,7 @@ def clip_to_pixel_range(block: np.ndarray, bit_depth: int = 8) -> np.ndarray:
 
 
 def intra_planar_predict(
-    top: np.ndarray,
-    left: np.ndarray,
-    top_right: int,
-    bottom_left: int,
-    size: int
+    top: np.ndarray, left: np.ndarray, top_right: int, bottom_left: int, size: int
 ) -> np.ndarray:
     """
     Planar intra prediction for an NxN block.
@@ -114,11 +145,7 @@ def intra_planar_predict(
 
 
 def intra_angular_predict(
-    top: np.ndarray,
-    left: np.ndarray,
-    top_left: int,
-    mode: int,
-    size: int
+    top: np.ndarray, left: np.ndarray, top_left: int, mode: int, size: int
 ) -> np.ndarray:
     """
     Angular intra prediction for an NxN block.
@@ -157,11 +184,7 @@ def intra_angular_predict(
 
 
 def _build_ref_array(
-    primary: np.ndarray,
-    secondary: np.ndarray,
-    corner: int,
-    angle: int,
-    size: int
+    primary: np.ndarray, secondary: np.ndarray, corner: int, angle: int, size: int
 ) -> np.ndarray:
     """
     Build 1D reference array for angular prediction.
@@ -181,19 +204,16 @@ def _build_ref_array(
         inv_angle = INV_ANGLE[angle]
         num_extend = (size * angle) >> 5
         for i in range(-1, num_extend - 1, -1):
-            proj = ((i + 1) * inv_angle + 128) >> 8
-            if proj < len(secondary):
+            # Fix: use i * inv_angle (not (i+1)) per H.265 spec and libde265
+            proj = (i * inv_angle + 128) >> 8
+            if 0 < proj < len(secondary):
                 ref[offset + i] = secondary[proj]
 
     return ref
 
 
 def _project_sample_at(
-    ref: np.ndarray,
-    base: int,
-    scan: int,
-    angle: int,
-    size: int
+    ref: np.ndarray, base: int, scan: int, angle: int, size: int
 ) -> int:
     """Project sample onto reference array with linear interpolation."""
     offset = size

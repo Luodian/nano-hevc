@@ -20,7 +20,8 @@ class Plane:
     Uses __slots__ to reduce memory overhead by ~40-50% compared to
     a regular class with __dict__.
     """
-    __slots__ = ('data',)
+
+    __slots__ = ("data",)
 
     def __init__(self, data: np.ndarray):
         self.data = data
@@ -40,11 +41,12 @@ class Plane:
     @classmethod
     def zeros(cls, height: int, width: int, dtype: np.dtype = np.int16) -> Plane:
         """Create a zero-filled plane with C-contiguous memory layout."""
-        return cls(data=np.zeros((height, width), dtype=dtype, order='C'))
+        return cls(data=np.zeros((height, width), dtype=dtype, order="C"))
 
     @classmethod
-    def from_buffer(cls, buffer: bytes, height: int, width: int,
-                    dtype: np.dtype = np.uint8) -> Plane:
+    def from_buffer(
+        cls, buffer: bytes, height: int, width: int, dtype: np.dtype = np.uint8
+    ) -> Plane:
         """Create a plane from raw bytes, ensuring C-contiguous layout."""
         data = np.frombuffer(buffer, dtype=dtype).reshape(height, width)
         # np.ascontiguousarray ensures C-contiguous and copies if needed
@@ -60,7 +62,8 @@ class Frame:
 
     Uses __slots__ to reduce memory overhead.
     """
-    __slots__ = ('y', 'u', 'v')
+
+    __slots__ = ("y", "u", "v")
 
     def __init__(self, y: Plane, u: Plane, v: Plane):
         self.y = y
@@ -104,15 +107,19 @@ class Frame:
 
         return cls(
             y=Plane.from_buffer(buffer[:y_size], height, width),
-            u=Plane.from_buffer(buffer[y_size:y_size + uv_size], uv_height, uv_width),
-            v=Plane.from_buffer(buffer[y_size + uv_size:y_size + 2 * uv_size], uv_height, uv_width),
+            u=Plane.from_buffer(buffer[y_size : y_size + uv_size], uv_height, uv_width),
+            v=Plane.from_buffer(
+                buffer[y_size + uv_size : y_size + 2 * uv_size], uv_height, uv_width
+            ),
         )
 
     def to_yuv420p(self) -> bytes:
         """Convert Frame back to raw YUV420p bytes."""
-        return (self.y.data.astype(np.uint8).tobytes() +
-                self.u.data.astype(np.uint8).tobytes() +
-                self.v.data.astype(np.uint8).tobytes())
+        # Clip to valid range before casting to avoid wrap-around
+        y_clipped = np.clip(self.y.data, 0, 255).astype(np.uint8)
+        u_clipped = np.clip(self.u.data, 0, 255).astype(np.uint8)
+        v_clipped = np.clip(self.v.data, 0, 255).astype(np.uint8)
+        return y_clipped.tobytes() + u_clipped.tobytes() + v_clipped.tobytes()
 
     def __repr__(self) -> str:
         return f"Frame(height={self.height}, width={self.width})"
@@ -129,7 +136,8 @@ class PackedFrame:
 
     Memory layout: [Y plane data][U plane data][V plane data]
     """
-    __slots__ = ('_buffer', 'y', 'u', 'v', 'height', 'width', '_y_size', '_uv_size')
+
+    __slots__ = ("_buffer", "y", "u", "v", "height", "width", "_y_size", "_uv_size")
 
     def __init__(self, height: int, width: int, dtype: np.dtype = np.int16):
         self.height = height
@@ -141,19 +149,23 @@ class PackedFrame:
         total = self._y_size + 2 * self._uv_size
 
         # Single contiguous allocation for all planes
-        self._buffer = np.zeros(total, dtype=dtype, order='C')
+        self._buffer = np.zeros(total, dtype=dtype, order="C")
 
         # Views into the same buffer (no copy)
-        self.y = self._buffer[:self._y_size].reshape(height, width)
-        self.u = self._buffer[self._y_size:self._y_size + self._uv_size].reshape(uv_height, uv_width)
-        self.v = self._buffer[self._y_size + self._uv_size:].reshape(uv_height, uv_width)
+        self.y = self._buffer[: self._y_size].reshape(height, width)
+        self.u = self._buffer[self._y_size : self._y_size + self._uv_size].reshape(
+            uv_height, uv_width
+        )
+        self.v = self._buffer[self._y_size + self._uv_size :].reshape(
+            uv_height, uv_width
+        )
 
     @classmethod
     def from_yuv420p(cls, buffer: bytes, height: int, width: int) -> PackedFrame:
         """Create a PackedFrame from raw YUV420p bytes."""
         frame = cls(height, width, dtype=np.uint8)
         data = np.frombuffer(buffer, dtype=np.uint8)
-        np.copyto(frame._buffer, data[:len(frame._buffer)])
+        np.copyto(frame._buffer, data[: len(frame._buffer)])
         return frame
 
     @classmethod
@@ -207,10 +219,17 @@ class FrameBufferPool:
         # Release back to pool
         pool.release(idx)
     """
-    __slots__ = ('_pool', '_available', '_in_use', 'height', 'width', 'dtype')
 
-    def __init__(self, height: int, width: int, pool_size: int = 4,
-                 dtype: np.dtype = np.int16, use_packed: bool = True):
+    __slots__ = ("_pool", "_available", "_in_use", "height", "width", "dtype")
+
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        pool_size: int = 4,
+        dtype: np.dtype = np.int16,
+        use_packed: bool = True,
+    ):
         """
         Initialize a frame buffer pool.
 
@@ -227,13 +246,11 @@ class FrameBufferPool:
 
         if use_packed:
             self._pool: List[PackedFrame | Frame] = [
-                PackedFrame(height, width, dtype=dtype)
-                for _ in range(pool_size)
+                PackedFrame(height, width, dtype=dtype) for _ in range(pool_size)
             ]
         else:
             self._pool = [
-                Frame.zeros(height, width, dtype=dtype)
-                for _ in range(pool_size)
+                Frame.zeros(height, width, dtype=dtype) for _ in range(pool_size)
             ]
 
         self._available: List[int] = list(range(pool_size))
@@ -304,5 +321,7 @@ class FrameBufferPool:
         return len(self._pool)
 
     def __repr__(self) -> str:
-        return (f"FrameBufferPool(height={self.height}, width={self.width}, "
-                f"available={self.available_count}/{self.pool_size})")
+        return (
+            f"FrameBufferPool(height={self.height}, width={self.width}, "
+            f"available={self.available_count}/{self.pool_size})"
+        )
