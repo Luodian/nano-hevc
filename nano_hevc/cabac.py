@@ -364,6 +364,9 @@ class CabacEncoder:
 
 def init_contexts_for_slice(slice_type: int, qp: int) -> dict:
     """Initialize all CABAC contexts for a slice."""
+    def contexts_with_init(init_value: int, count: int) -> list[CabacContext]:
+        return [CabacContext(init_value) for _ in range(count)]
+
     contexts = {}
 
     contexts["split_cu_flag"] = [
@@ -391,17 +394,17 @@ def init_contexts_for_slice(slice_type: int, qp: int) -> dict:
         CabacContext(154),
     ]
     contexts["transform_skip"] = [CabacContext(139), CabacContext(139)]
-    contexts["last_sig_coeff_x_prefix"] = [CabacContext(125)] * 18
-    contexts["last_sig_coeff_y_prefix"] = [CabacContext(125)] * 18
+    contexts["last_sig_coeff_x_prefix"] = contexts_with_init(125, 18)
+    contexts["last_sig_coeff_y_prefix"] = contexts_with_init(125, 18)
     contexts["coded_sub_block_flag"] = [
         CabacContext(121),
         CabacContext(140),
         CabacContext(61),
         CabacContext(154),
     ]
-    contexts["sig_coeff_flag"] = [CabacContext(170)] * 42
-    contexts["coeff_abs_level_greater1"] = [CabacContext(154)] * 24
-    contexts["coeff_abs_level_greater2"] = [CabacContext(154)] * 6
+    contexts["sig_coeff_flag"] = contexts_with_init(170, 42)
+    contexts["coeff_abs_level_greater1"] = contexts_with_init(154, 24)
+    contexts["coeff_abs_level_greater2"] = contexts_with_init(154, 6)
 
     return contexts
 

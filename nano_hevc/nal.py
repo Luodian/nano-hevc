@@ -126,8 +126,7 @@ def write_vps(writer: BitstreamWriter, config: HEVCConfig) -> None:
     writer.write_bits(0, 6)
     writer.write_bits(0, 3)
     writer.write_bit(1)
-    writer.write_bits(0, 2)
-    writer.write_bits(0, 6)
+    writer.write_bits(0xFFFF, 16)
 
     write_profile_tier_level(writer, config)
 
@@ -283,7 +282,10 @@ def create_parameter_sets(config: HEVCConfig) -> bytes:
     write_vps(writer, config)
     write_sps(writer, config)
     write_pps(writer, config)
-    return writer.get_bytes_with_emulation_prevention()
+    # Parameter sets are emitted as Annex-B NAL units with explicit start codes.
+    # Applying emulation-prevention over the whole byte stream would corrupt those
+    # start codes (e.g., 00 00 01 -> 00 00 03 01), so keep raw bytes here.
+    return writer.get_bytes()
 
 
 def create_slice_nal_unit(

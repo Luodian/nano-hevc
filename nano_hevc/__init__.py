@@ -58,7 +58,7 @@ from nano_hevc.scan import (
 from nano_hevc.bitstream import BitstreamWriter
 from nano_hevc.cabac import CabacEncoder, CabacContext, init_contexts_for_slice
 from nano_hevc.nal import HEVCConfig, create_parameter_sets
-from nano_hevc.encoder import encode_frame, encode_video
+from nano_hevc.encoder import encode_frame, encode_video, encode_video_nano, encode_video_ffmpeg
 
 __all__ = [
     "Plane",
@@ -116,4 +116,6 @@ __all__ = [
     "create_parameter_sets",
     "encode_frame",
     "encode_video",
+    "encode_video_nano",
+    "encode_video_ffmpeg",
 ]

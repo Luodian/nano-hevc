@@ -16,10 +16,10 @@ The code prioritizes clarity and readability over performance.
 - [x] Integer transform (4x4, 8x8, 16x16, 32x32 DCT)
 - [x] 4x4 DST-VII for luma intra blocks
 - [x] Quantization / Dequantization (QP 0-51)
-- [ ] Zig-zag and other scan patterns
-- [ ] CABAC entropy coding
-- [ ] NAL unit generation (VPS/SPS/PPS/Slice)
-- [ ] Complete encoding pipeline
+- [x] Zig-zag and other scan patterns (diagonal/horizontal/vertical)
+- [ ] CABAC entropy coding (coefficients + CBF - partial syntax)
+- [x] NAL unit generation (VPS/SPS/PPS/Slice)
+- [ ] Intra-only encoding pipeline (minimal slice syntax)
 
 ## Installation
 
@@ -71,6 +71,32 @@ recon_coeff = dequantize_block(levels, qp=22)
 recon_residual = inverse_transform(recon_coeff, use_dst=True)
 ```
 
+Encode a raw YUV420p file to .265:
+
+```python
+from nano_hevc.encoder import encode_video
+
+stats = encode_video(
+    "input.yuv",
+    "output.265",
+    width=640,
+    height=360,
+    num_frames=1,
+    qp=27,
+)
+print(stats)
+```
+
+Production-grade HEVC output via ffmpeg/libx265:
+
+```bash
+python -m nano_hevc.encoder examples/videos/red_bull_300f_640x360.mp4 \
+  -o examples/videos/red_bull_300f_640x360.ffmpeg.hevc \
+  --width 640 --height 360 --frames 300 \
+  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 \
+  --show-frame-types
+```
+
 ## Running Tests
 
 > to make sure that I understand the HEVC's logic correctly, I advise GPT5.1/Gemini 3.0 Pro and industry experts to provide test suggestions before I start the project.
@@ -94,10 +120,12 @@ nano_hevc/
     intra.py              # Intra prediction (DC, Planar, Angular)
     transform.py          # Integer DCT/DST transforms
     quant.py              # Quantization / Dequantization
-    scan.py               # Scan patterns (TODO)
-    cabac.py              # CABAC entropy coding (TODO)
-    nal.py                # NAL unit generation (TODO)
-    encoder.py            # Main encoding loop (TODO)
+    scan.py               # Scan patterns (diagonal/horizontal/vertical)
+    bitstream.py          # Bitstream writer with emulation prevention
+    cabac.py              # CABAC entropy coding (coefficients + CBF - partial)
+    nal.py                # NAL unit generation (VPS/SPS/PPS/Slice)
+    encoder.py            # Main encoding loop (intra-only, minimal slice syntax)
+    metrics.py            # PSNR utilities
   tests/
     test_intra_dc.py
     test_intra_planar.py

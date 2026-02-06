@@ -34,3 +34,8 @@ Thumbs.db
 # Local dev
 *.local
 .env
+
+# Local media samples / encoded artifacts
+examples/videos/*.mp4
+examples/videos/*.265
+examples/videos/*.hevc
