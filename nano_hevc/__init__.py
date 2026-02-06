@@ -58,8 +58,6 @@ from nano_hevc.scan import (
 from nano_hevc.bitstream import BitstreamWriter
 from nano_hevc.cabac import CabacEncoder, CabacContext, init_contexts_for_slice
 from nano_hevc.nal import HEVCConfig, create_parameter_sets
-from nano_hevc.encoder import encode_frame, encode_video, encode_video_nano, encode_video_ffmpeg
-
 __all__ = [
     "Plane",
     "Frame",
@@ -118,4 +116,21 @@ __all__ = [
     "encode_video",
     "encode_video_nano",
     "encode_video_ffmpeg",
+    "decode_video_nano",
 ]
+
+_LAZY_ENCODER_EXPORTS = {
+    "encode_frame",
+    "encode_video",
+    "encode_video_nano",
+    "encode_video_ffmpeg",
+    "decode_video_nano",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_ENCODER_EXPORTS:
+        from nano_hevc import encoder as _encoder
+
+        return getattr(_encoder, name)
+    raise AttributeError(f"module 'nano_hevc' has no attribute {name!r}")

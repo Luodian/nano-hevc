@@ -17,9 +17,12 @@ The code prioritizes clarity and readability over performance.
 - [x] 4x4 DST-VII for luma intra blocks
 - [x] Quantization / Dequantization (QP 0-51)
 - [x] Zig-zag and other scan patterns (diagonal/horizontal/vertical)
-- [ ] CABAC entropy coding (coefficients + CBF - partial syntax)
+- [x] NHEVC1 container encode/decode round-trip
+- [x] ffmpeg backend for standards-compliant HEVC output
+- [ ] CABAC entropy coding (coefficients + CBF only; syntax is partial)
 - [x] NAL unit generation (VPS/SPS/PPS/Slice)
-- [ ] Intra-only encoding pipeline (minimal slice syntax)
+- [ ] Full HEVC-compliant intra-only bitstream from nano backend
+- [ ] Inter prediction / motion estimation (P/B coding)
 
 ## Installation
 
@@ -71,30 +74,111 @@ recon_coeff = dequantize_block(levels, qp=22)
 recon_residual = inverse_transform(recon_coeff, use_dst=True)
 ```
 
-Encode a raw YUV420p file to .265:
+Encode a raw YUV420p file with the `nano` backend (NHEVC1 container):
 
 ```python
 from nano_hevc.encoder import encode_video
 
 stats = encode_video(
     "input.yuv",
-    "output.265",
+    "output.nhevc",
     width=640,
     height=360,
     num_frames=1,
     qp=27,
+    backend="nano",
 )
 print(stats)
 ```
 
-Production-grade HEVC output via ffmpeg/libx265:
+Encode with `nano` reconstruction + standard HEVC output (intra-only GOP):
 
 ```bash
 python -m nano_hevc.encoder examples/videos/red_bull_300f_640x360.mp4 \
-  -o examples/videos/red_bull_300f_640x360.ffmpeg.hevc \
+  -o /tmp/red_bull_300f.nano.std.hevc \
   --width 640 --height 360 --frames 300 \
-  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 \
-  --show-frame-types
+  --backend nano --qp 27 --fast \
+  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28
+```
+
+Decode `nano` container back to YUV/MP4:
+
+```bash
+# to raw yuv420p
+python -m nano_hevc.encoder output.nhevc -o decoded.yuv --decode-nano
+
+# to mp4
+python -m nano_hevc.encoder output.nhevc -o decoded.mp4 --decode-nano --decode-codec libx264
+```
+
+## Red Bull Example Workflow (First 2 Minutes)
+
+Use local HD source:
+
+```bash
+cp /path/to/red_bull.mp4 examples/videos/red_bull.mp4
+```
+
+Create a 2-minute, 640x360 test clip (about 3000 frames at 25fps):
+
+```bash
+ffmpeg -y -i examples/videos/red_bull.mp4 -t 120 \
+  -vf scale=640:360 -an -c:v libx264 -preset veryfast -crf 20 \
+  examples/videos/red_bull_first2min_640x360.mp4
+```
+
+Run full `nano` container round-trip:
+
+```bash
+# encode to nano container
+python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
+  -o /tmp/red_bull_first2min.nano.nhevc \
+  --width 640 --height 360 --frames 3000 \
+  --backend nano --qp 27 --fast --show-frame-types
+
+# decode nano container back to playable mp4
+python -m nano_hevc.encoder /tmp/red_bull_first2min.nano.nhevc \
+  -o /tmp/red_bull_first2min.decoded.mp4 --decode-nano --decode-codec libx264
+```
+
+Output standard HEVC from nano backend (reconstructed frames piped to ffmpeg):
+
+```bash
+python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
+  -o /tmp/red_bull_first2min.nano.std.hevc \
+  --width 640 --height 360 --frames 3000 \
+  --backend nano --qp 27 --fast --show-frame-types \
+  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28
+```
+
+Baseline standard HEVC directly from ffmpeg backend:
+
+```bash
+python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
+  -o /tmp/red_bull_first2min.ffmpeg.hevc \
+  --width 640 --height 360 --frames 3000 \
+  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 --show-frame-types
+```
+
+Compare bitrates:
+
+```bash
+for f in /tmp/red_bull_first2min.nano.nhevc \
+         /tmp/red_bull_first2min.nano.std.hevc \
+         /tmp/red_bull_first2min.ffmpeg.hevc; do
+  echo "=== $f ==="
+  ffprobe -hide_banner -loglevel error -show_entries format=size,bit_rate,duration \
+    -of default=noprint_wrappers=1 "$f" || true
+done
+```
+
+Verify decoded output:
+
+```bash
+ffprobe -hide_banner -loglevel error -count_frames -select_streams v:0 \
+  -show_entries stream=codec_name,width,height,avg_frame_rate,nb_read_frames,pix_fmt \
+  -show_entries format=duration,size,bit_rate \
+  -of default=noprint_wrappers=1 /tmp/red_bull_first2min.decoded.mp4
 ```
 
 ## Running Tests
@@ -124,9 +208,10 @@ nano_hevc/
     bitstream.py          # Bitstream writer with emulation prevention
     cabac.py              # CABAC entropy coding (coefficients + CBF - partial)
     nal.py                # NAL unit generation (VPS/SPS/PPS/Slice)
-    encoder.py            # Main encoding loop (intra-only, minimal slice syntax)
+    encoder.py            # Nano/ffmpeg backends + nano container decode
     metrics.py            # PSNR utilities
   tests/
+    test_encoder.py
     test_intra_dc.py
     test_intra_planar.py
     test_intra_angular.py

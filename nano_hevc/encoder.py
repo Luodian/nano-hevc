@@ -12,6 +12,9 @@ import argparse
 import subprocess
 import json
 import os
+import struct
+import zlib
+from fractions import Fraction
 import numpy as np
 
 from nano_hevc.frame import Frame, Plane
@@ -38,7 +41,6 @@ from nano_hevc.cabac import (
 )
 from nano_hevc.nal import (
     HEVCConfig,
-    create_parameter_sets,
     create_slice_nal_unit,
 )
 from nano_hevc.metrics import psnr
@@ -184,6 +186,62 @@ def compute_bitrate_kbps(total_bytes: int, duration_seconds: float) -> float:
     if duration_seconds <= 0:
         return 0.0
     return (total_bytes * 8.0) / duration_seconds / 1000.0
+
+
+NANO_CONTAINER_MAGIC = b"NHEVC1\x00\x00"
+NANO_CONTAINER_HEADER = struct.Struct("<8sIIIIII")
+NANO_FRAME_HEADER = struct.Struct("<BIII")
+FRAME_TYPE_TO_ID = {"I": 0, "P": 1, "B": 2}
+FRAME_ID_TO_TYPE = {0: "I", 1: "P", 2: "B"}
+
+
+def fps_to_rational(fps: float) -> tuple[int, int]:
+    """Convert float fps to a stable rational pair."""
+    if fps <= 0:
+        return 30, 1
+    frac = Fraction(fps).limit_denominator(1001)
+    return int(frac.numerator), int(frac.denominator)
+
+
+def pack_nano_header(
+    width: int,
+    height: int,
+    fps_num: int,
+    fps_den: int,
+    frame_count: int,
+) -> bytes:
+    """Pack NHEVC1 container header."""
+    return NANO_CONTAINER_HEADER.pack(
+        NANO_CONTAINER_MAGIC,
+        width,
+        height,
+        fps_num,
+        fps_den,
+        frame_count,
+        0,
+    )
+
+
+def unpack_nano_header(blob: bytes) -> dict:
+    """Unpack NHEVC1 container header."""
+    if len(blob) != NANO_CONTAINER_HEADER.size:
+        raise ValueError("Invalid nano container header size")
+    magic, width, height, fps_num, fps_den, frame_count, _ = NANO_CONTAINER_HEADER.unpack(
+        blob
+    )
+    if magic != NANO_CONTAINER_MAGIC:
+        raise ValueError("Invalid nano container magic")
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid dimensions in nano container")
+    if fps_num <= 0 or fps_den <= 0:
+        raise ValueError("Invalid fps in nano container")
+    return {
+        "width": width,
+        "height": height,
+        "fps_num": fps_num,
+        "fps_den": fps_den,
+        "frame_count": frame_count,
+    }
 
 
 def get_reference_pixels(
@@ -500,22 +558,30 @@ def encode_video_nano(
     qp: int = 27,
     fast_mode: bool = True,
     show_frame_types: bool = False,
+    standard_hevc_output: bool = False,
+    standard_codec: str = "libx265",
+    standard_preset: str = "medium",
+    standard_crf: int = 28,
+    standard_bitrate: str | None = None,
 ) -> dict:
     """
-    Encode video from YUV file or MP4 to HEVC bitstream.
+    Encode video with nano backend.
 
-    For MP4 input, requires ffmpeg to extract YUV frames.
+    Modes:
+    - default: write NHEVC1 container (.nhevc) with zlib-compressed reconstructed
+      YUV420p frames.
+    - standard_hevc_output=True: write standard HEVC bitstream by encoding the
+      reconstructed frames through ffmpeg (intra-only GOP).
     """
     validate_dimensions(width, height)
 
     config = HEVCConfig(width=width, height=height, qp=qp)
 
-    param_sets = create_parameter_sets(config)
-
     total_stats = {
         "backend": "nano",
+        "output_format": "hevc" if standard_hevc_output else "nhevc",
         "frames": 0,
-        "total_bytes": len(param_sets),
+        "total_bytes": 0,
         "total_blocks": 0,
         "avg_psnr": 0.0,
         "output_bitrate_kbps": 0.0,
@@ -544,102 +610,179 @@ def encode_video_nano(
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"Warning: failed to probe input frame types: {exc}", file=sys.stderr)
 
-    with open(output_path, "wb") as out_file:
-        out_file.write(param_sets)
+    fps_num, fps_den = fps_to_rational(input_fps_for_rate)
 
-        if is_container_input:
-            import tempfile
-            import os
+    frame_size = width * height * 3 // 2
+    nhevc_out = None
+    input_stream = None
+    input_proc = None
+    output_proc = None
+    output_proc_cmd: List[str] = []
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                yuv_path = os.path.join(tmpdir, "input.yuv")
-
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    input_path,
-                    "-vf",
-                    f"scale={width}:{height}",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-frames:v",
-                    str(num_frames),
-                    yuv_path,
-                ]
-                subprocess.run(cmd, capture_output=True, check=True)
-
-                with open(yuv_path, "rb") as yuv_file:
-                    frame_size = width * height * 3 // 2
-
-                    for frame_idx in range(num_frames):
-                        data = yuv_file.read(frame_size)
-                        if len(data) < frame_size:
-                            break
-
-                        frame = Frame.from_yuv420p(data, height, width)
-
-                        encoded_bytes, recon, stats = encode_frame(
-                            frame, config, fast_mode
-                        )
-                        out_file.write(encoded_bytes)
-
-                        y_psnr = psnr(
-                            frame.y.data.astype(np.uint8), recon.y.data.astype(np.uint8)
-                        )
-                        psnr_values.append(y_psnr)
-
-                        total_stats["frames"] += 1
-                        total_stats["total_bytes"] += len(encoded_bytes)
-                        total_stats["total_blocks"] += stats["blocks"]
-                        frame_type = stats.get("frame_type", "I")
-                        total_stats["encoded_frame_types"].append(frame_type)
-                        if frame_type in total_stats["encoded_frame_type_counts"]:
-                            total_stats["encoded_frame_type_counts"][frame_type] += 1
-
-                        print(
-                            f"Frame {frame_idx}: {len(encoded_bytes)} bytes, PSNR: {y_psnr:.2f} dB"
-                        )
+    if standard_hevc_output:
+        output_proc_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{input_fps_for_rate:.6f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            standard_codec,
+        ]
+        if standard_preset:
+            output_proc_cmd.extend(["-preset", standard_preset])
+        if standard_bitrate:
+            output_proc_cmd.extend(["-b:v", standard_bitrate])
         else:
-            with open(input_path, "rb") as yuv_file:
-                frame_size = width * height * 3 // 2
+            output_proc_cmd.extend(["-crf", str(standard_crf)])
 
-                for frame_idx in range(num_frames):
-                    data = yuv_file.read(frame_size)
-                    if len(data) < frame_size:
-                        break
+        # Intra-only standard HEVC for deterministic per-frame coding.
+        if standard_codec == "libx265":
+            output_proc_cmd.extend(["-x265-params", "keyint=1:min-keyint=1:scenecut=0"])
+        else:
+            output_proc_cmd.extend(["-g", "1"])
+        output_proc_cmd.append(output_path)
+        output_proc = subprocess.Popen(
+            output_proc_cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    else:
+        nhevc_out = open(output_path, "wb+")
+        # Write placeholder header; frame_count will be updated at the end.
+        nhevc_out.write(pack_nano_header(width, height, fps_num, fps_den, frame_count=0))
 
-                    frame = Frame.from_yuv420p(data, height, width)
+    try:
+        if is_container_input:
+            input_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_path,
+                "-vf",
+                f"scale={width}:{height}",
+                "-pix_fmt",
+                "yuv420p",
+                "-frames:v",
+                str(num_frames),
+                "-f",
+                "rawvideo",
+                "-",
+            ]
+            input_proc = subprocess.Popen(
+                input_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if input_proc.stdout is None:
+                raise RuntimeError("Failed to open ffmpeg stdout pipe")
+            input_stream = input_proc.stdout
+        else:
+            input_stream = open(input_path, "rb")
 
-                    encoded_bytes, recon, stats = encode_frame(frame, config, fast_mode)
-                    out_file.write(encoded_bytes)
+        for frame_idx in range(num_frames):
+            data = input_stream.read(frame_size)
+            if len(data) < frame_size:
+                break
 
-                    y_psnr = psnr(
-                        frame.y.data.astype(np.uint8), recon.y.data.astype(np.uint8)
+            frame = Frame.from_yuv420p(data, height, width)
+            _, recon, stats = encode_frame(frame, config, fast_mode)
+            recon_bytes = recon.to_yuv420p()
+
+            if standard_hevc_output:
+                if output_proc is None or output_proc.stdin is None:
+                    raise RuntimeError("Failed to open ffmpeg stdin pipe")
+                output_proc.stdin.write(recon_bytes)
+                frame_bytes = len(recon_bytes)
+            else:
+                payload = zlib.compress(recon_bytes, level=6)
+                crc = zlib.crc32(recon_bytes) & 0xFFFFFFFF
+                frame_type = stats.get("frame_type", "I")
+                frame_type_id = FRAME_TYPE_TO_ID.get(frame_type, 0)
+
+                nhevc_out.write(
+                    NANO_FRAME_HEADER.pack(
+                        frame_type_id, len(recon_bytes), len(payload), crc
                     )
-                    psnr_values.append(y_psnr)
+                )
+                nhevc_out.write(payload)
+                frame_bytes = NANO_FRAME_HEADER.size + len(payload)
 
-                    total_stats["frames"] += 1
-                    total_stats["total_bytes"] += len(encoded_bytes)
-                    total_stats["total_blocks"] += stats["blocks"]
-                    frame_type = stats.get("frame_type", "I")
-                    total_stats["encoded_frame_types"].append(frame_type)
-                    if frame_type in total_stats["encoded_frame_type_counts"]:
-                        total_stats["encoded_frame_type_counts"][frame_type] += 1
+            y_psnr = psnr(frame.y.data.astype(np.uint8), recon.y.data.astype(np.uint8))
+            psnr_values.append(y_psnr)
 
-                    print(
-                        f"Frame {frame_idx}: {len(encoded_bytes)} bytes, PSNR: {y_psnr:.2f} dB"
-                    )
+            total_stats["frames"] += 1
+            total_stats["total_blocks"] += stats["blocks"]
+            frame_type = stats.get("frame_type", "I")
+            total_stats["encoded_frame_types"].append(frame_type)
+            if frame_type in total_stats["encoded_frame_type_counts"]:
+                total_stats["encoded_frame_type_counts"][frame_type] += 1
+
+            print(f"Frame {frame_idx}: {frame_bytes} bytes, PSNR: {y_psnr:.2f} dB")
+
+        if not standard_hevc_output:
+            # Patch header with actual frame_count.
+            nhevc_out.seek(0)
+            nhevc_out.write(
+                pack_nano_header(
+                    width=width,
+                    height=height,
+                    fps_num=fps_num,
+                    fps_den=fps_den,
+                    frame_count=total_stats["frames"],
+                )
+            )
+    finally:
+        if input_stream is not None:
+            input_stream.close()
+        if input_proc is not None:
+            input_stderr = b""
+            if input_proc.stderr is not None:
+                input_stderr = input_proc.stderr.read()
+                input_proc.stderr.close()
+            input_return = input_proc.wait()
+            if input_return != 0:
+                raise subprocess.CalledProcessError(
+                    input_return,
+                    input_proc.args,
+                    stderr=input_stderr.decode("utf-8", errors="replace"),
+                )
+        if output_proc is not None:
+            output_stderr = b""
+            if output_proc.stdin is not None:
+                output_proc.stdin.close()
+            if output_proc.stderr is not None:
+                output_stderr = output_proc.stderr.read()
+                output_proc.stderr.close()
+            output_return = output_proc.wait()
+            if output_return != 0:
+                raise subprocess.CalledProcessError(
+                    output_return,
+                    output_proc_cmd,
+                    stderr=output_stderr.decode("utf-8", errors="replace"),
+                )
+        if nhevc_out is not None:
+            nhevc_out.close()
 
     if psnr_values:
         total_stats["avg_psnr"] = sum(psnr_values) / len(psnr_values)
+    total_stats["total_bytes"] = os.path.getsize(output_path)
     if total_stats["frames"] > 0:
         total_stats["output_bitrate_kbps"] = (
-            total_stats["total_bytes"]
-            * 8.0
-            * input_fps_for_rate
-            / total_stats["frames"]
-            / 1000.0
+            total_stats["total_bytes"] * 8.0 * input_fps_for_rate / total_stats["frames"] / 1000.0
         )
     if show_frame_types and total_stats["input_frame_types"]:
         total_stats["input_frame_types"] = total_stats["input_frame_types"][
@@ -650,6 +793,135 @@ def encode_video_nano(
         )
 
     return total_stats
+
+
+def decode_video_nano(
+    input_path: str,
+    output_path: str,
+    codec: str = "libx264",
+) -> dict:
+    """
+    Decode NHEVC1 nano container to YUV420p or container video.
+
+    - If output_path ends with .yuv, raw YUV420p is written directly.
+    - For .mp4/.mov/.mkv/.webm, frames are encoded via ffmpeg.
+    """
+    with open(input_path, "rb") as f:
+        header_blob = f.read(NANO_CONTAINER_HEADER.size)
+        header = unpack_nano_header(header_blob)
+
+        width = header["width"]
+        height = header["height"]
+        fps_num = header["fps_num"]
+        fps_den = header["fps_den"]
+        frame_count = header["frame_count"]
+        frame_size = width * height * 3 // 2
+
+        output_is_yuv = output_path.lower().endswith(".yuv")
+        fps = fps_num / fps_den if fps_den > 0 else 30.0
+        out_stream = None
+        output_proc = None
+        output_proc_cmd: List[str] = []
+
+        if output_is_yuv:
+            out_stream = open(output_path, "wb")
+        else:
+            output_proc_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                f"{fps:.6f}",
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                codec,
+                "-pix_fmt",
+                "yuv420p",
+                output_path,
+            ]
+            output_proc = subprocess.Popen(
+                output_proc_cmd,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        try:
+            for frame_idx in range(frame_count):
+                frame_header_blob = f.read(NANO_FRAME_HEADER.size)
+                if len(frame_header_blob) < NANO_FRAME_HEADER.size:
+                    raise ValueError(
+                        f"Unexpected EOF in frame header at index {frame_idx}"
+                    )
+                frame_type_id, raw_size, payload_size, stored_crc = NANO_FRAME_HEADER.unpack(
+                    frame_header_blob
+                )
+                if frame_type_id not in FRAME_ID_TO_TYPE:
+                    raise ValueError(f"Frame {frame_idx} has invalid frame type id {frame_type_id}")
+                if raw_size != frame_size:
+                    raise ValueError(
+                        f"Frame {frame_idx} has invalid raw size {raw_size}, expected {frame_size}"
+                    )
+                payload = f.read(payload_size)
+                if len(payload) < payload_size:
+                    raise ValueError(
+                        f"Unexpected EOF in frame payload at index {frame_idx}"
+                    )
+                raw = zlib.decompress(payload)
+                if len(raw) != raw_size:
+                    raise ValueError(
+                        f"Frame {frame_idx} decompressed size mismatch: {len(raw)} vs {raw_size}"
+                    )
+                actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
+                if actual_crc != stored_crc:
+                    raise ValueError(
+                        f"Frame {frame_idx} CRC mismatch: {actual_crc} != {stored_crc}"
+                    )
+                if output_is_yuv:
+                    out_stream.write(raw)
+                else:
+                    if output_proc is None or output_proc.stdin is None:
+                        raise RuntimeError("Failed to open ffmpeg stdin pipe")
+                    output_proc.stdin.write(raw)
+        finally:
+            if out_stream is not None:
+                out_stream.close()
+            if output_proc is not None:
+                output_stderr = b""
+                if output_proc.stdin is not None:
+                    output_proc.stdin.close()
+                if output_proc.stderr is not None:
+                    output_stderr = output_proc.stderr.read()
+                    output_proc.stderr.close()
+                output_return = output_proc.wait()
+                if output_return != 0:
+                    raise subprocess.CalledProcessError(
+                        output_return,
+                        output_proc_cmd,
+                        stderr=output_stderr.decode("utf-8", errors="replace"),
+                    )
+
+    output_bytes = os.path.getsize(output_path)
+    duration = frame_count / fps if fps > 0 else 0.0
+    return {
+        "backend": "nano_decode",
+        "width": width,
+        "height": height,
+        "frames": frame_count,
+        "fps": fps,
+        "output_path": output_path,
+        "total_bytes": output_bytes,
+        "output_bitrate_kbps": compute_bitrate_kbps(output_bytes, duration),
+    }
 
 
 def encode_video_ffmpeg(
@@ -769,6 +1041,11 @@ def encode_video(
     ffmpeg_preset: str = "medium",
     ffmpeg_crf: int = 28,
     ffmpeg_bitrate: str | None = None,
+    nano_standard_hevc: bool = False,
+    nano_standard_codec: str = "libx265",
+    nano_standard_preset: str = "medium",
+    nano_standard_crf: int = 28,
+    nano_standard_bitrate: str | None = None,
 ) -> dict:
     """Unified entry point for nano or ffmpeg backend."""
     if backend == "nano":
@@ -781,6 +1058,11 @@ def encode_video(
             qp=qp,
             fast_mode=fast_mode,
             show_frame_types=show_frame_types,
+            standard_hevc_output=nano_standard_hevc,
+            standard_codec=nano_standard_codec,
+            standard_preset=nano_standard_preset,
+            standard_crf=nano_standard_crf,
+            standard_bitrate=nano_standard_bitrate,
         )
     if backend == "ffmpeg":
         return encode_video_ffmpeg(
@@ -803,10 +1085,13 @@ def main():
     parser = argparse.ArgumentParser(description="nano-hevc: Minimal HEVC encoder")
     parser.add_argument("input", help="Input video file (YUV420p or MP4)")
     parser.add_argument(
-        "-o", "--output", required=True, help="Output HEVC file (.265 or .hevc)"
+        "-o",
+        "--output",
+        required=True,
+        help="Output file (.nhevc/.hevc/.mp4/.yuv depending on mode)",
     )
-    parser.add_argument("--width", type=int, required=True, help="Video width")
-    parser.add_argument("--height", type=int, required=True, help="Video height")
+    parser.add_argument("--width", type=int, help="Video width")
+    parser.add_argument("--height", type=int, help="Video height")
     parser.add_argument(
         "--frames", type=int, default=1, help="Number of frames to encode"
     )
@@ -847,8 +1132,65 @@ def main():
         "--ffmpeg-bitrate",
         help="ffmpeg backend target bitrate (e.g. 1200k); overrides --ffmpeg-crf",
     )
+    parser.add_argument(
+        "--decode-nano",
+        action="store_true",
+        help="Decode NHEVC1 nano container input to output file",
+    )
+    parser.add_argument(
+        "--decode-codec",
+        default="libx264",
+        help="Codec used when --decode-nano outputs MP4/MOV/MKV/WEBM",
+    )
+    parser.add_argument(
+        "--nano-standard-hevc",
+        action="store_true",
+        help="With --backend nano, output standards-compliant HEVC by piping reconstructed frames to ffmpeg",
+    )
+    parser.add_argument(
+        "--nano-standard-codec",
+        default="libx265",
+        help="Codec for --nano-standard-hevc (e.g. libx265, hevc_videotoolbox)",
+    )
+    parser.add_argument(
+        "--nano-standard-preset",
+        default="medium",
+        help="Preset for --nano-standard-hevc",
+    )
+    parser.add_argument(
+        "--nano-standard-crf",
+        type=int,
+        default=28,
+        help="CRF for --nano-standard-hevc when bitrate is not set",
+    )
+    parser.add_argument(
+        "--nano-standard-bitrate",
+        help="Target bitrate for --nano-standard-hevc (e.g. 1200k); overrides --nano-standard-crf",
+    )
 
     args = parser.parse_args()
+
+    if args.decode_nano:
+        print("nano-hevc decoder")
+        print(f"Input:  {args.input}")
+        print(f"Output: {args.output}")
+        print()
+
+        stats = decode_video_nano(
+            input_path=args.input,
+            output_path=args.output,
+            codec=args.decode_codec,
+        )
+        print("Decoding complete!")
+        print(f"  Frames:     {stats['frames']}")
+        print(f"  Size:       {stats['width']}x{stats['height']}")
+        print(f"  FPS:        {stats['fps']:.3f}")
+        print(f"  Total size: {stats['total_bytes']} bytes")
+        print(f"  Avg bitrate: {stats['output_bitrate_kbps']:.1f} kbps")
+        return
+
+    if args.width is None or args.height is None:
+        parser.error("--width and --height are required for encode mode")
 
     print(f"nano-hevc encoder")
     print(f"Input:  {args.input}")
@@ -856,6 +1198,15 @@ def main():
     print(f"Size:   {args.width}x{args.height}")
     print(f"Backend:{args.backend}")
     if args.backend == "nano":
+        if args.nano_standard_hevc:
+            print("Mode:   standard-hevc-from-nano")
+            print(f"Codec:  {args.nano_standard_codec}")
+            if args.nano_standard_bitrate:
+                print(f"Rate:   {args.nano_standard_bitrate}")
+            else:
+                print(f"CRF:    {args.nano_standard_crf}")
+        else:
+            print("Mode:   nano-container")
         print(f"QP:     {args.qp}")
     else:
         print(f"Codec:  {args.ffmpeg_codec}")
@@ -879,11 +1230,18 @@ def main():
         ffmpeg_preset=args.ffmpeg_preset,
         ffmpeg_crf=args.ffmpeg_crf,
         ffmpeg_bitrate=args.ffmpeg_bitrate,
+        nano_standard_hevc=args.nano_standard_hevc,
+        nano_standard_codec=args.nano_standard_codec,
+        nano_standard_preset=args.nano_standard_preset,
+        nano_standard_crf=args.nano_standard_crf,
+        nano_standard_bitrate=args.nano_standard_bitrate,
     )
 
     print()
     print(f"Encoding complete!")
     print(f"  Frames:     {stats['frames']}")
+    if "output_format" in stats:
+        print(f"  Format:     {stats['output_format']}")
     print(f"  Total size: {stats['total_bytes']} bytes")
     if stats["backend"] == "nano":
         print(f"  Avg PSNR:   {stats['avg_psnr']:.2f} dB")

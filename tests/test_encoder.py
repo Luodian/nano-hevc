@@ -1,8 +1,10 @@
 import numpy as np
+from unittest.mock import patch
 
 from nano_hevc.cabac import init_contexts_for_slice
 from nano_hevc.encoder import (
     compute_bitrate_kbps,
+    decode_video_nano,
     encode_video,
     iter_block_coords,
     parse_ratio_to_float,
@@ -115,3 +117,90 @@ def test_encode_video_unknown_backend_raises(tmp_path):
         pass
     else:
         raise AssertionError("Expected ValueError for unknown backend")
+
+
+def test_encode_video_forwards_nano_standard_hevc_flags(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "nano",
+        "output_format": "hevc",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_nano", return_value=fake_stats) as mocked:
+        stats = encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="nano",
+            nano_standard_hevc=True,
+            nano_standard_codec="libx265",
+            nano_standard_preset="slow",
+            nano_standard_crf=24,
+            nano_standard_bitrate=None,
+        )
+
+    assert stats["output_format"] == "hevc"
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["standard_hevc_output"] is True
+    assert kwargs["standard_codec"] == "libx265"
+    assert kwargs["standard_preset"] == "slow"
+    assert kwargs["standard_crf"] == 24
+
+
+def test_nano_container_roundtrip_yuv(tmp_path):
+    width, height = 16, 16
+    frame_size = width * height * 3 // 2
+    frame0 = bytes([32]) * frame_size
+    frame1 = bytes([160]) * frame_size
+
+    input_path = tmp_path / "input_2f.yuv"
+    output_path = tmp_path / "output_2f.nhevc"
+    decoded_path = tmp_path / "decoded_2f.yuv"
+    input_path.write_bytes(frame0 + frame1)
+
+    stats = encode_video(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        width=width,
+        height=height,
+        num_frames=2,
+        qp=27,
+        fast_mode=True,
+        backend="nano",
+    )
+    assert stats["frames"] == 2
+
+    blob = output_path.read_bytes()
+    assert blob.startswith(b"NHEVC1\x00")
+
+    dec_stats = decode_video_nano(str(output_path), str(decoded_path))
+    assert dec_stats["frames"] == 2
+    assert dec_stats["width"] == width
+    assert dec_stats["height"] == height
+    assert decoded_path.stat().st_size == frame_size * 2
+
+
+def test_decode_video_nano_bad_magic(tmp_path):
+    bad_path = tmp_path / "bad.nhevc"
+    out_path = tmp_path / "out.yuv"
+    bad_path.write_bytes(b"NOT_NHEVC")
+
+    try:
+        decode_video_nano(str(bad_path), str(out_path))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected ValueError for invalid nano container")
