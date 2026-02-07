@@ -96,21 +96,19 @@ def write_profile_tier_level(
     writer: BitstreamWriter, config: HEVCConfig, max_sub_layers: int = 1
 ) -> None:
     """Write profile_tier_level syntax."""
-    writer.write_bits(0, 2)
-    writer.write_bit(1)
-    writer.write_bits(0, 5)
+    profile_idc = max(1, min(int(config.profile), 31))
+    writer.write_bits(0, 2)  # general_profile_space
+    writer.write_bit(0)  # general_tier_flag (Main tier)
+    writer.write_bits(profile_idc, 5)  # general_profile_idc
 
     compatibility_flags = 0
-    if config.profile == PROFILE_MAIN:
-        compatibility_flags = 1 << (31 - PROFILE_MAIN)
-    elif config.profile == PROFILE_MAIN_10:
-        compatibility_flags = 1 << (31 - PROFILE_MAIN_10)
+    compatibility_flags |= 1 << (31 - profile_idc)
     writer.write_bits(compatibility_flags, 32)
 
     writer.write_bit(1)
-    writer.write_bit(config.bit_depth > 8)
     writer.write_bit(0)
     writer.write_bit(0)
+    writer.write_bit(1)
     writer.write_bits(0, 44)
 
     writer.write_bits(config.level, 8)
@@ -130,11 +128,14 @@ def write_vps(writer: BitstreamWriter, config: HEVCConfig) -> None:
 
     write_profile_tier_level(writer, config)
 
-    writer.write_bit(0)
-
-    writer.write_ue(0)
-    writer.write_ue(0)
-    writer.write_bits(0, 1)
+    writer.write_bit(1)  # vps_sub_layer_ordering_info_present_flag
+    writer.write_ue(2)  # vps_max_dec_pic_buffering_minus1[0]
+    writer.write_ue(0)  # vps_max_num_reorder_pics[0]
+    writer.write_ue(1)  # vps_max_latency_increase_plus1[0]
+    writer.write_bits(0, 6)  # vps_max_layer_id
+    writer.write_ue(0)  # vps_num_layer_sets_minus1
+    writer.write_bit(0)  # vps_timing_info_present_flag
+    writer.write_bit(0)  # vps_extension_flag
 
     writer.write_rbsp_trailing_bits()
 
@@ -210,25 +211,29 @@ def write_pps(writer: BitstreamWriter, config: HEVCConfig) -> None:
     writer.write_bit(0)
     writer.write_bits(0, 3)
 
+    writer.write_bit(config.sign_data_hiding)
     writer.write_bit(0)
-    writer.write_bit(0)
+
+    writer.write_ue(0)
+    writer.write_ue(0)
     writer.write_se(0)
 
-    writer.write_bit(0)
-    writer.write_bit(0)
-    writer.write_se(0)
-    writer.write_se(0)
-
-    writer.write_bit(0)
     writer.write_bit(0)
     writer.write_bit(config.transform_skip_enabled)
     writer.write_bit(0)
-    writer.write_bit(config.sign_data_hiding)
-
+    writer.write_se(0)
+    writer.write_se(0)
     writer.write_bit(0)
     writer.write_bit(0)
     writer.write_bit(0)
     writer.write_bit(0)
+    writer.write_bit(0)
+    writer.write_bit(0)
+    writer.write_bit(1)
+    writer.write_bit(0)
+    writer.write_bit(0)
+    writer.write_bit(0)
+    writer.write_ue(0)
     writer.write_bit(0)
     writer.write_bit(0)
 
@@ -255,11 +260,11 @@ def write_slice_header(
             writer.write_bit(0)
 
     writer.write_ue(0)
-
     if not is_first_slice:
-        writer.write_bit(0)
+        writer.write_bit(0)  # dependent_slice_segment_flag
 
     writer.write_ue(slice_type)
+    # num_extra_slice_header_bits from PPS is zero in this encoder.
 
     if slice_type != 2:
         log2_max_poc = 8
@@ -274,6 +279,10 @@ def write_slice_header(
 
     if config.sao_enabled:
         writer.write_bit(0)
+
+    # pps_loop_filter_across_slices_enabled_flag is 1 in write_pps(), and
+    # deblocking is implicitly enabled, so this flag is present.
+    writer.write_bit(1)
 
 
 def create_parameter_sets(config: HEVCConfig) -> bytes:

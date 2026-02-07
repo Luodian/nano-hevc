@@ -21,6 +21,16 @@ def test_create_parameter_sets_preserve_annexb_start_codes():
     assert b"\x00\x00\x03\x00\x01" not in data
 
 
+def test_create_parameter_sets_nal_types():
+    data = create_parameter_sets(HEVCConfig(width=64, height=64))
+    chunks = data.split(b"\x00\x00\x00\x01")
+    nals = [chunk for chunk in chunks if chunk]
+    assert len(nals) == 3
+
+    nal_types = [((nal[0] << 8) | nal[1]) >> 9 & 0x3F for nal in nals]
+    assert nal_types == [32, 33, 34]
+
+
 def test_cabac_context_arrays_do_not_share_objects():
     contexts = init_contexts_for_slice(slice_type=2, qp=27)
 
