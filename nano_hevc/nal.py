@@ -305,6 +305,21 @@ def create_slice_nal_unit(
     poc: int = 0,
 ) -> bytes:
     """Create complete slice NAL unit with header and data."""
+
+    def apply_emulation_prevention(rbsp: bytes) -> bytes:
+        out = bytearray()
+        zero_count = 0
+        for byte in rbsp:
+            if zero_count >= 2 and byte <= 0x03:
+                out.append(0x03)
+                zero_count = 0
+            out.append(byte)
+            if byte == 0x00:
+                zero_count += 1
+            else:
+                zero_count = 0
+        return bytes(out)
+
     writer = BitstreamWriter()
     write_start_code_prefix(writer)
 
@@ -319,8 +334,11 @@ def create_slice_nal_unit(
         writer.write_bit(1)
 
     header_bytes = writer.get_bytes()
+    if len(header_bytes) < 6:
+        return header_bytes + slice_data
 
-    full_data = bytearray(header_bytes)
-    full_data.extend(slice_data)
-
-    return bytes(full_data)
+    start_code = header_bytes[:4]
+    nal_header = header_bytes[4:6]
+    rbsp = header_bytes[6:] + slice_data
+    escaped_rbsp = apply_emulation_prevention(rbsp)
+    return start_code + nal_header + escaped_rbsp

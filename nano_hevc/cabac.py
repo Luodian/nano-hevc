@@ -318,24 +318,28 @@ class CabacEncoder:
         else:
             if self._num_buffered_bytes > 0:
                 carry = lead_byte >> 8
-                byte_val = self._buffered_byte + carry
+                byte_val = (self._buffered_byte + carry) & 0xFF
                 self._buffer.append(byte_val)
 
                 while self._num_buffered_bytes > 1:
                     byte_val = (0xFF + carry) & 0xFF
                     self._buffer.append(byte_val)
                     self._num_buffered_bytes -= 1
-                self._num_buffered_bytes = 0
+                # Keep one buffered byte as in HM/VTM writeOut behavior.
+                self._num_buffered_bytes = 1
+            else:
+                self._num_buffered_bytes = 1
 
             self._buffered_byte = lead_byte & 0xFF
 
     def _encode_final(self) -> None:
         """Finalize encoding."""
         if self._low >> (32 - self._bits_left):
-            self._buffer.append(self._buffered_byte + 1)
+            self._buffer.append((self._buffered_byte + 1) & 0xFF)
             while self._num_buffered_bytes > 1:
                 self._buffer.append(0x00)
                 self._num_buffered_bytes -= 1
+            self._low -= 1 << (32 - self._bits_left)
         else:
             if self._num_buffered_bytes > 0:
                 self._buffer.append(self._buffered_byte)

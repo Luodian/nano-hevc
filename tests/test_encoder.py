@@ -1,7 +1,7 @@
 import numpy as np
 from unittest.mock import patch
 
-from nano_hevc.cabac import init_contexts_for_slice
+from nano_hevc.cabac import CabacContext, CabacEncoder, init_contexts_for_slice
 from nano_hevc.encoder import (
     compute_bitrate_kbps,
     decode_video_nano,
@@ -12,7 +12,7 @@ from nano_hevc.encoder import (
     summarize_frame_types,
     validate_dimensions,
 )
-from nano_hevc.nal import HEVCConfig, create_parameter_sets
+from nano_hevc.nal import HEVCConfig, create_parameter_sets, create_slice_nal_unit
 
 
 def test_create_parameter_sets_preserve_annexb_start_codes():
@@ -43,6 +43,28 @@ def test_cabac_context_arrays_do_not_share_objects():
     ):
         ids = {id(ctx) for ctx in contexts[key]}
         assert len(ids) == len(contexts[key]), key
+
+
+def test_cabac_encoder_emits_nontrivial_stream():
+    enc = CabacEncoder()
+    ctx = CabacContext(111)
+    for i in range(512):
+        enc.encode_bin(i & 1, ctx)
+    enc.encode_terminate(1)
+
+    out = enc.get_bytes()
+    assert len(out) > 16
+
+
+def test_slice_nal_inserts_emulation_prevention_in_payload():
+    cfg = HEVCConfig(width=64, height=64, qp=27)
+    # Deliberately contains start-code-like pattern.
+    slice_data = b"\x00\x00\x01\x02\x00\x00\x03\x04"
+    nal = create_slice_nal_unit(cfg, slice_data=slice_data, is_first_slice=True, slice_type=2, poc=0)
+
+    # Start code should only appear at the front.
+    assert nal.startswith(b"\x00\x00\x00\x01")
+    assert nal[4:].find(b"\x00\x00\x01") == -1
 
 
 def test_iter_block_coords_covers_full_plane():
