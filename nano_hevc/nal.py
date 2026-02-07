@@ -314,6 +314,9 @@ def create_slice_nal_unit(
         write_nal_unit_header(writer, NAL_TRAIL_R)
 
     write_slice_header(writer, config, is_first_slice, slice_type, poc)
+    # byte_alignment(): alignment_bit_equal_to_one until next byte boundary
+    while writer.bit_count % 8 != 0:
+        writer.write_bit(1)
 
     header_bytes = writer.get_bytes()
 

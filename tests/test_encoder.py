@@ -172,6 +172,40 @@ def test_encode_video_forwards_nano_standard_hevc_flags(tmp_path):
     assert kwargs["standard_intra_only"] is True
 
 
+def test_encode_video_forwards_nano_native_hevc_flag(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output_native.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "nano",
+        "output_format": "hevc_native",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_nano", return_value=fake_stats) as mocked:
+        stats = encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="nano",
+            nano_native_hevc=True,
+        )
+
+    assert stats["output_format"] == "hevc_native"
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["native_hevc_output"] is True
+
+
 def test_nano_container_roundtrip_yuv(tmp_path):
     width, height = 16, 16
     frame_size = width * height * 3 // 2
