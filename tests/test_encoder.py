@@ -150,6 +150,7 @@ def test_encode_video_forwards_nano_standard_hevc_flags(tmp_path):
             nano_standard_preset="slow",
             nano_standard_crf=24,
             nano_standard_bitrate=None,
+            nano_standard_intra_only=True,
         )
 
     assert stats["output_format"] == "hevc"
@@ -158,6 +159,7 @@ def test_encode_video_forwards_nano_standard_hevc_flags(tmp_path):
     assert kwargs["standard_codec"] == "libx265"
     assert kwargs["standard_preset"] == "slow"
     assert kwargs["standard_crf"] == 24
+    assert kwargs["standard_intra_only"] is True
 
 
 def test_nano_container_roundtrip_yuv(tmp_path):

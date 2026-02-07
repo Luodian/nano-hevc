@@ -98,8 +98,12 @@ python -m nano_hevc.encoder examples/videos/red_bull_300f_640x360.mp4 \
   -o /tmp/red_bull_300f.nano.std.hevc \
   --width 640 --height 360 --frames 300 \
   --backend nano --qp 27 --fast \
-  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28
+  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28 \
+  --nano-standard-intra-only
 ```
+
+If your goal is bitrate parity with ffmpeg defaults, do not set
+`--nano-standard-intra-only` so ffmpeg can use P/B frames.
 
 Decode `nano` container back to YUV/MP4:
 

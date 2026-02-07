@@ -563,6 +563,7 @@ def encode_video_nano(
     standard_preset: str = "medium",
     standard_crf: int = 28,
     standard_bitrate: str | None = None,
+    standard_intra_only: bool = False,
 ) -> dict:
     """
     Encode video with nano backend.
@@ -571,7 +572,7 @@ def encode_video_nano(
     - default: write NHEVC1 container (.nhevc) with zlib-compressed reconstructed
       YUV420p frames.
     - standard_hevc_output=True: write standard HEVC bitstream by encoding the
-      reconstructed frames through ffmpeg (intra-only GOP).
+      reconstructed frames through ffmpeg.
     """
     validate_dimensions(width, height)
 
@@ -647,11 +648,14 @@ def encode_video_nano(
         else:
             output_proc_cmd.extend(["-crf", str(standard_crf)])
 
-        # Intra-only standard HEVC for deterministic per-frame coding.
-        if standard_codec == "libx265":
-            output_proc_cmd.extend(["-x265-params", "keyint=1:min-keyint=1:scenecut=0"])
-        else:
-            output_proc_cmd.extend(["-g", "1"])
+        if standard_intra_only:
+            # Intra-only standard HEVC for deterministic per-frame coding.
+            if standard_codec == "libx265":
+                output_proc_cmd.extend(
+                    ["-x265-params", "keyint=1:min-keyint=1:scenecut=0"]
+                )
+            else:
+                output_proc_cmd.extend(["-g", "1"])
         output_proc_cmd.append(output_path)
         output_proc = subprocess.Popen(
             output_proc_cmd,
@@ -784,6 +788,18 @@ def encode_video_nano(
         total_stats["output_bitrate_kbps"] = (
             total_stats["total_bytes"] * 8.0 * input_fps_for_rate / total_stats["frames"] / 1000.0
         )
+    if standard_hevc_output and show_frame_types:
+        try:
+            encoded_frame_types = probe_input_frame_types(output_path)
+            total_stats["encoded_frame_types"] = encoded_frame_types
+            total_stats["encoded_frame_type_counts"] = summarize_frame_types(
+                encoded_frame_types
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(
+                f"Warning: failed to probe output frame types: {exc}",
+                file=sys.stderr,
+            )
     if show_frame_types and total_stats["input_frame_types"]:
         total_stats["input_frame_types"] = total_stats["input_frame_types"][
             : total_stats["frames"]
@@ -1046,6 +1062,7 @@ def encode_video(
     nano_standard_preset: str = "medium",
     nano_standard_crf: int = 28,
     nano_standard_bitrate: str | None = None,
+    nano_standard_intra_only: bool = False,
 ) -> dict:
     """Unified entry point for nano or ffmpeg backend."""
     if backend == "nano":
@@ -1063,6 +1080,7 @@ def encode_video(
             standard_preset=nano_standard_preset,
             standard_crf=nano_standard_crf,
             standard_bitrate=nano_standard_bitrate,
+            standard_intra_only=nano_standard_intra_only,
         )
     if backend == "ffmpeg":
         return encode_video_ffmpeg(
@@ -1167,6 +1185,11 @@ def main():
         "--nano-standard-bitrate",
         help="Target bitrate for --nano-standard-hevc (e.g. 1200k); overrides --nano-standard-crf",
     )
+    parser.add_argument(
+        "--nano-standard-intra-only",
+        action="store_true",
+        help="With --nano-standard-hevc, force all-I output (keyint=1)",
+    )
 
     args = parser.parse_args()
 
@@ -1201,6 +1224,7 @@ def main():
         if args.nano_standard_hevc:
             print("Mode:   standard-hevc-from-nano")
             print(f"Codec:  {args.nano_standard_codec}")
+            print(f"Intra:  {'yes' if args.nano_standard_intra_only else 'no'}")
             if args.nano_standard_bitrate:
                 print(f"Rate:   {args.nano_standard_bitrate}")
             else:
@@ -1235,6 +1259,7 @@ def main():
         nano_standard_preset=args.nano_standard_preset,
         nano_standard_crf=args.nano_standard_crf,
         nano_standard_bitrate=args.nano_standard_bitrate,
+        nano_standard_intra_only=args.nano_standard_intra_only,
     )
 
     print()
