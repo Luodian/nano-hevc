@@ -1,4 +1,6 @@
 import numpy as np
+import shutil
+import subprocess
 from unittest.mock import patch
 
 from nano_hevc.cabac import CabacContext, CabacEncoder, init_contexts_for_slice
@@ -272,3 +274,50 @@ def test_decode_video_nano_bad_magic(tmp_path):
         pass
     else:
         raise AssertionError("Expected ValueError for invalid nano container")
+
+
+def test_native_hevc_single_frame_decodable(tmp_path):
+    if shutil.which("ffprobe") is None:
+        return
+
+    width, height = 16, 16
+    frame_size = width * height * 3 // 2
+    input_path = tmp_path / "input_1f.yuv"
+    output_path = tmp_path / "output_1f_native.hevc"
+    input_path.write_bytes(bytes([128]) * frame_size)
+
+    stats = encode_video(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        width=width,
+        height=height,
+        num_frames=1,
+        qp=27,
+        fast_mode=True,
+        backend="nano",
+        nano_native_hevc=True,
+    )
+
+    assert stats["output_format"] == "hevc_native"
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,pix_fmt,nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "width=16" in result.stdout
+    assert "height=16" in result.stdout
+    assert "pix_fmt=yuv420p" in result.stdout
