@@ -118,6 +118,9 @@ python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
 This mode is syntax-level experimental: the stream is decodable by standard
 HEVC decoders, but coding syntax is still incomplete and visual fidelity is
 not yet at production quality.
+Current native mode prioritizes bitstream stability (minimal intra syntax with
+zero-residual signaling), so quality/efficiency can differ from the `nano`
+reconstruction stats.
 
 Decode `nano` container back to YUV/MP4:
 

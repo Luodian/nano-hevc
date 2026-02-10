@@ -480,7 +480,10 @@ def encode_coefficients_cabac(
 
 
 def encode_frame(
-    frame: Frame, config: HEVCConfig, fast_mode: bool = True
+    frame: Frame,
+    config: HEVCConfig,
+    fast_mode: bool = True,
+    native_minimal_syntax: bool = False,
 ) -> Tuple[bytes, Frame, dict]:
     """
     Encode a single frame.
@@ -525,15 +528,27 @@ def encode_frame(
                     stats["cbf_count"] += 1
                     stats["total_coeffs"] += np.count_nonzero(encoded.coeffs)
 
-            if encoded.cbf:
-                ctx = contexts["cbf_luma" if is_luma else "cbf_chroma"][0]
-                cabac.encode_bin(1, ctx)
-                encode_coefficients_cabac(
-                    cabac, contexts, encoded.coeffs, encoded.mode, is_luma
-                )
-            else:
+            if native_minimal_syntax and is_luma:
+                # Experimental native HEVC mode: write a minimal intra syntax
+                # shell per luma block, while forcing zero residual coding.
+                cabac.encode_bin(0, contexts["split_cu_flag"][0])
+                cabac.encode_bin(0, contexts["part_mode"][0])
+                cabac.encode_bin(0, contexts["intra_luma_pred_mode"][0])
+                cabac.encode_bin(0, contexts["intra_chroma_pred_mode"][0])
+
+            if native_minimal_syntax:
                 ctx = contexts["cbf_luma" if is_luma else "cbf_chroma"][0]
                 cabac.encode_bin(0, ctx)
+            else:
+                if encoded.cbf:
+                    ctx = contexts["cbf_luma" if is_luma else "cbf_chroma"][0]
+                    cabac.encode_bin(1, ctx)
+                    encode_coefficients_cabac(
+                        cabac, contexts, encoded.coeffs, encoded.mode, is_luma
+                    )
+                else:
+                    ctx = contexts["cbf_luma" if is_luma else "cbf_chroma"][0]
+                    cabac.encode_bin(0, ctx)
 
     cabac.encode_terminate(1)
 
@@ -717,7 +732,12 @@ def encode_video_nano(
                 break
 
             frame = Frame.from_yuv420p(data, height, width)
-            encoded_bytes, recon, stats = encode_frame(frame, config, fast_mode)
+            encoded_bytes, recon, stats = encode_frame(
+                frame,
+                config,
+                fast_mode,
+                native_minimal_syntax=native_hevc_output,
+            )
             recon_bytes = recon.to_yuv420p()
 
             if standard_hevc_output:
