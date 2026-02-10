@@ -48,6 +48,12 @@ def test_cabac_context_arrays_do_not_share_objects():
         assert len(ids) == len(contexts[key]), key
 
 
+def test_cabac_context_initialization_depends_on_qp():
+    low_qp_ctx = CabacContext(111, qp=0)
+    high_qp_ctx = CabacContext(111, qp=51)
+    assert (low_qp_ctx.state, low_qp_ctx.mps) != (high_qp_ctx.state, high_qp_ctx.mps)
+
+
 def test_cabac_encoder_emits_nontrivial_stream():
     enc = CabacEncoder()
     ctx = CabacContext(111)

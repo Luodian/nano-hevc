@@ -218,10 +218,11 @@ class CabacContext:
 
     __slots__ = ("state", "mps")
 
-    def __init__(self, init_value: int = 64):
+    def __init__(self, init_value: int = 64, qp: int = 26):
         slope = (init_value >> 4) * 5 - 45
         offset = ((init_value & 15) << 3) - 16
-        init_state = min(max(1, ((slope * 26 + offset) >> 4) + 1), 126)
+        qp_clamped = min(max(qp, 0), 51)
+        init_state = min(max(1, ((slope * qp_clamped + offset) >> 4) + 1), 126)
 
         if init_state >= 64:
             self.state = init_state - 64
@@ -369,42 +370,42 @@ class CabacEncoder:
 def init_contexts_for_slice(slice_type: int, qp: int) -> dict:
     """Initialize all CABAC contexts for a slice."""
     def contexts_with_init(init_value: int, count: int) -> list[CabacContext]:
-        return [CabacContext(init_value) for _ in range(count)]
+        return [CabacContext(init_value, qp=qp) for _ in range(count)]
 
     contexts = {}
 
     contexts["split_cu_flag"] = [
-        CabacContext(139),
-        CabacContext(141),
-        CabacContext(157),
+        CabacContext(139, qp=qp),
+        CabacContext(141, qp=qp),
+        CabacContext(157, qp=qp),
     ]
-    contexts["skip_flag"] = [CabacContext(197), CabacContext(185)]
-    contexts["merge_flag"] = [CabacContext(110)]
-    contexts["merge_idx"] = [CabacContext(122)]
-    contexts["pred_mode"] = [CabacContext(149)]
+    contexts["skip_flag"] = [CabacContext(197, qp=qp), CabacContext(185, qp=qp)]
+    contexts["merge_flag"] = [CabacContext(110, qp=qp)]
+    contexts["merge_idx"] = [CabacContext(122, qp=qp)]
+    contexts["pred_mode"] = [CabacContext(149, qp=qp)]
     contexts["part_mode"] = [
-        CabacContext(154),
-        CabacContext(139),
-        CabacContext(154),
-        CabacContext(154),
+        CabacContext(154, qp=qp),
+        CabacContext(139, qp=qp),
+        CabacContext(154, qp=qp),
+        CabacContext(154, qp=qp),
     ]
-    contexts["intra_luma_pred_mode"] = [CabacContext(183)]
-    contexts["intra_chroma_pred_mode"] = [CabacContext(152), CabacContext(139)]
-    contexts["cbf_luma"] = [CabacContext(111), CabacContext(141)]
+    contexts["intra_luma_pred_mode"] = [CabacContext(183, qp=qp)]
+    contexts["intra_chroma_pred_mode"] = [CabacContext(152, qp=qp), CabacContext(139, qp=qp)]
+    contexts["cbf_luma"] = [CabacContext(111, qp=qp), CabacContext(141, qp=qp)]
     contexts["cbf_chroma"] = [
-        CabacContext(94),
-        CabacContext(138),
-        CabacContext(182),
-        CabacContext(154),
+        CabacContext(94, qp=qp),
+        CabacContext(138, qp=qp),
+        CabacContext(182, qp=qp),
+        CabacContext(154, qp=qp),
     ]
-    contexts["transform_skip"] = [CabacContext(139), CabacContext(139)]
+    contexts["transform_skip"] = [CabacContext(139, qp=qp), CabacContext(139, qp=qp)]
     contexts["last_sig_coeff_x_prefix"] = contexts_with_init(125, 18)
     contexts["last_sig_coeff_y_prefix"] = contexts_with_init(125, 18)
     contexts["coded_sub_block_flag"] = [
-        CabacContext(121),
-        CabacContext(140),
-        CabacContext(61),
-        CabacContext(154),
+        CabacContext(121, qp=qp),
+        CabacContext(140, qp=qp),
+        CabacContext(61, qp=qp),
+        CabacContext(154, qp=qp),
     ]
     contexts["sig_coeff_flag"] = contexts_with_init(170, 42)
     contexts["coeff_abs_level_greater1"] = contexts_with_init(154, 24)
