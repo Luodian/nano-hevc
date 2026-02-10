@@ -117,6 +117,7 @@ __all__ = [
     "encode_video_nano",
     "encode_video_ffmpeg",
     "decode_video_nano",
+    "analyze_video_stream",
 ]
 
 _LAZY_ENCODER_EXPORTS = {
@@ -125,6 +126,7 @@ _LAZY_ENCODER_EXPORTS = {
     "encode_video_nano",
     "encode_video_ffmpeg",
     "decode_video_nano",
+    "analyze_video_stream",
 }
 
 

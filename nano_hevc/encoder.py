@@ -120,7 +120,11 @@ def summarize_frame_types(frame_types: List[str]) -> dict:
     return summary
 
 
-def probe_input_frame_types(input_path: str) -> List[str]:
+def probe_input_frame_types(
+    input_path: str,
+    start_time: float | None = None,
+    duration: float | None = None,
+) -> List[str]:
     """Use ffprobe to extract per-frame pict_type labels from a video file."""
     cmd = [
         "ffprobe",
@@ -129,12 +133,24 @@ def probe_input_frame_types(input_path: str) -> List[str]:
         "error",
         "-select_streams",
         "v:0",
-        "-show_entries",
-        "frame=pict_type",
-        "-of",
-        "csv=p=0",
-        input_path,
     ]
+    if start_time is not None and start_time > 0:
+        interval = f"{start_time:g}%"
+        if duration is not None and duration > 0:
+            interval = f"{start_time:g}%+{duration:g}"
+        cmd.extend(["-read_intervals", interval])
+    elif duration is not None and duration > 0:
+        cmd.extend(["-read_intervals", f"0%+{duration:g}"])
+
+    cmd.extend(
+        [
+            "-show_entries",
+            "frame=pict_type",
+            "-of",
+            "csv=p=0",
+            input_path,
+        ]
+    )
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return parse_ffprobe_pict_types(result.stdout)
 
@@ -187,6 +203,41 @@ def compute_bitrate_kbps(total_bytes: int, duration_seconds: float) -> float:
     if duration_seconds <= 0:
         return 0.0
     return (total_bytes * 8.0) / duration_seconds / 1000.0
+
+
+def analyze_video_stream(
+    input_path: str,
+    start_time: float | None = None,
+    duration: float | None = None,
+    max_frames: int = 0,
+) -> dict:
+    """Collect basic metadata plus frame-type distribution from ffprobe."""
+    meta = probe_video_metadata(input_path)
+    frame_types: List[str] = []
+    try:
+        frame_types = probe_input_frame_types(
+            input_path,
+            start_time=start_time,
+            duration=duration,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        frame_types = []
+
+    if max_frames > 0:
+        frame_types = frame_types[:max_frames]
+
+    return {
+        "path": input_path,
+        "fps": meta["fps"],
+        "frame_count": meta["frame_count"],
+        "duration": meta["duration"],
+        "size": meta["size"],
+        "bitrate_kbps": compute_bitrate_kbps(meta["size"], meta["duration"]),
+        "frame_types": frame_types,
+        "frame_type_counts": summarize_frame_types(frame_types),
+        "segment_start": start_time or 0.0,
+        "segment_duration": duration,
+    }
 
 
 NANO_CONTAINER_MAGIC = b"NHEVC1\x00\x00"
@@ -581,6 +632,8 @@ def encode_video_nano(
     standard_crf: int = 28,
     standard_bitrate: str | None = None,
     standard_intra_only: bool = False,
+    start_time: float | None = None,
+    duration: float | None = None,
 ) -> dict:
     """
     Encode video with nano backend.
@@ -630,7 +683,13 @@ def encode_video_nano(
 
     if show_frame_types and is_container_input:
         try:
-            input_frame_types = probe_input_frame_types(input_path)[:num_frames]
+            input_frame_types = probe_input_frame_types(
+                input_path,
+                start_time=start_time,
+                duration=duration,
+            )
+            if num_frames > 0:
+                input_frame_types = input_frame_types[:num_frames]
             total_stats["input_frame_types"] = input_frame_types
             total_stats["input_frame_type_counts"] = summarize_frame_types(input_frame_types)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
@@ -703,18 +762,23 @@ def encode_video_nano(
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                "-i",
-                input_path,
-                "-vf",
-                f"scale={width}:{height}",
-                "-pix_fmt",
-                "yuv420p",
-                "-frames:v",
-                str(num_frames),
-                "-f",
-                "rawvideo",
-                "-",
             ]
+            if start_time is not None and start_time > 0:
+                input_cmd.extend(["-ss", f"{start_time:.6f}"])
+            input_cmd.extend(["-i", input_path])
+            if duration is not None and duration > 0:
+                input_cmd.extend(["-t", f"{duration:.6f}"])
+            input_cmd.extend(
+                [
+                    "-vf",
+                    f"scale={width}:{height}",
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            )
+            if num_frames > 0:
+                input_cmd.extend(["-frames:v", str(num_frames)])
+            input_cmd.extend(["-f", "rawvideo", "-"])
             input_proc = subprocess.Popen(
                 input_cmd,
                 stdout=subprocess.PIPE,
@@ -726,7 +790,8 @@ def encode_video_nano(
         else:
             input_stream = open(input_path, "rb")
 
-        for frame_idx in range(num_frames):
+        frame_idx = 0
+        while num_frames <= 0 or frame_idx < num_frames:
             data = input_stream.read(frame_size)
             if len(data) < frame_size:
                 break
@@ -775,6 +840,7 @@ def encode_video_nano(
                 total_stats["encoded_frame_type_counts"][frame_type] += 1
 
             print(f"Frame {frame_idx}: {frame_bytes} bytes, PSNR: {y_psnr:.2f} dB")
+            frame_idx += 1
 
         if not standard_hevc_output and not native_hevc_output:
             # Patch header with actual frame_count.
@@ -992,6 +1058,8 @@ def encode_video_ffmpeg(
     preset: str = "medium",
     crf: int = 28,
     bitrate: str | None = None,
+    start_time: float | None = None,
+    duration: float | None = None,
 ) -> dict:
     """
     Encode video using ffmpeg's HEVC encoders (production backend).
@@ -1017,16 +1085,23 @@ def encode_video_ffmpeg(
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        input_path,
-        "-vf",
-        f"scale={width}:{height}",
-        "-pix_fmt",
-        "yuv420p",
-        "-an",
-        "-c:v",
-        codec,
     ]
+    if start_time is not None and start_time > 0:
+        cmd.extend(["-ss", f"{start_time:.6f}"])
+    cmd.extend(["-i", input_path])
+    if duration is not None and duration > 0:
+        cmd.extend(["-t", f"{duration:.6f}"])
+    cmd.extend(
+        [
+            "-vf",
+            f"scale={width}:{height}",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-c:v",
+            codec,
+        ]
+    )
 
     if preset:
         cmd.extend(["-preset", preset])
@@ -1054,7 +1129,11 @@ def encode_video_ffmpeg(
         except (subprocess.CalledProcessError, FileNotFoundError):
             encoded_frame_types = []
         try:
-            input_frame_types = probe_input_frame_types(input_path)
+            input_frame_types = probe_input_frame_types(
+                input_path,
+                start_time=start_time,
+                duration=duration,
+            )
             if num_frames > 0:
                 input_frame_types = input_frame_types[:num_frames]
         except (subprocess.CalledProcessError, FileNotFoundError):
@@ -1105,6 +1184,8 @@ def encode_video(
     nano_standard_bitrate: str | None = None,
     nano_standard_intra_only: bool = False,
     nano_native_hevc: bool = False,
+    start_time: float | None = None,
+    duration: float | None = None,
 ) -> dict:
     """Unified entry point for nano or ffmpeg backend."""
     if backend == "nano":
@@ -1124,6 +1205,8 @@ def encode_video(
             standard_crf=nano_standard_crf,
             standard_bitrate=nano_standard_bitrate,
             standard_intra_only=nano_standard_intra_only,
+            start_time=start_time,
+            duration=duration,
         )
     if backend == "ffmpeg":
         return encode_video_ffmpeg(
@@ -1137,6 +1220,8 @@ def encode_video(
             preset=ffmpeg_preset,
             crf=ffmpeg_crf,
             bitrate=ffmpeg_bitrate,
+            start_time=start_time,
+            duration=duration,
         )
     raise ValueError(f"Unknown backend: {backend}")
 
@@ -1148,13 +1233,23 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        required=True,
         help="Output file (.nhevc/.hevc/.mp4/.yuv depending on mode)",
     )
     parser.add_argument("--width", type=int, help="Video width")
     parser.add_argument("--height", type=int, help="Video height")
     parser.add_argument(
         "--frames", type=int, default=1, help="Number of frames to encode"
+    )
+    parser.add_argument(
+        "--start-time",
+        type=float,
+        default=0.0,
+        help="Start timestamp in seconds for container inputs",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        help="Duration in seconds for container inputs",
     )
     parser.add_argument(
         "--qp", type=int, default=27, help="Quantization parameter (0-51)"
@@ -1199,6 +1294,11 @@ def main():
         help="Decode NHEVC1 nano container input to output file",
     )
     parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Analyze input video metadata and frame type distribution only",
+    )
+    parser.add_argument(
         "--decode-codec",
         default="libx264",
         help="Codec used when --decode-nano outputs MP4/MOV/MKV/WEBM",
@@ -1241,7 +1341,31 @@ def main():
 
     args = parser.parse_args()
 
+    if args.analyze:
+        analysis = analyze_video_stream(
+            args.input,
+            start_time=args.start_time if args.start_time > 0 else None,
+            duration=args.duration,
+            max_frames=max(args.frames, 0),
+        )
+        print("nano-hevc analyzer")
+        print(f"Input:  {analysis['path']}")
+        print(f"FPS:    {analysis['fps']:.3f}")
+        print(f"Frames: {analysis['frame_count']}")
+        print(f"Dur(s): {analysis['duration']:.3f}")
+        print(f"Size:   {analysis['size']} bytes")
+        print(f"Bitrate:{analysis['bitrate_kbps']:.1f} kbps")
+        counts = analysis["frame_type_counts"]
+        print(f"Types:  I={counts['I']} P={counts['P']} B={counts['B']}")
+        if analysis["frame_types"]:
+            preview = "".join(analysis["frame_types"][:32])
+            suffix = "..." if len(analysis["frame_types"]) > 32 else ""
+            print(f"Seq:    {preview}{suffix}")
+        return
+
     if args.decode_nano:
+        if not args.output:
+            parser.error("--output is required with --decode-nano")
         print("nano-hevc decoder")
         print(f"Input:  {args.input}")
         print(f"Output: {args.output}")
@@ -1259,6 +1383,9 @@ def main():
         print(f"  Total size: {stats['total_bytes']} bytes")
         print(f"  Avg bitrate: {stats['output_bitrate_kbps']:.1f} kbps")
         return
+
+    if not args.output:
+        parser.error("--output is required for encode mode")
 
     if args.width is None or args.height is None:
         parser.error("--width and --height are required for encode mode")
@@ -1313,6 +1440,8 @@ def main():
         nano_standard_bitrate=args.nano_standard_bitrate,
         nano_standard_intra_only=args.nano_standard_intra_only,
         nano_native_hevc=args.nano_native_hevc,
+        start_time=args.start_time if args.start_time > 0 else None,
+        duration=args.duration,
     )
 
     print()

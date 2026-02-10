@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from nano_hevc.cabac import CabacContext, CabacEncoder, init_contexts_for_slice
 from nano_hevc.encoder import (
+    analyze_video_stream,
     compute_bitrate_kbps,
     decode_video_nano,
     encode_video,
@@ -196,6 +197,41 @@ def test_encode_video_forwards_nano_standard_hevc_flags(tmp_path):
     assert kwargs["standard_intra_only"] is True
 
 
+def test_encode_video_forwards_segment_flags_to_nano(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "nano",
+        "output_format": "hevc",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_nano", return_value=fake_stats) as mocked:
+        encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="nano",
+            start_time=10.0,
+            duration=120.0,
+        )
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["start_time"] == 10.0
+    assert kwargs["duration"] == 120.0
+
+
 def test_encode_video_forwards_nano_native_hevc_flag(tmp_path):
     input_path = tmp_path / "input.yuv"
     output_path = tmp_path / "output_native.hevc"
@@ -228,6 +264,66 @@ def test_encode_video_forwards_nano_native_hevc_flag(tmp_path):
     assert stats["output_format"] == "hevc_native"
     kwargs = mocked.call_args.kwargs
     assert kwargs["native_hevc_output"] is True
+
+
+def test_encode_video_forwards_segment_flags_to_ffmpeg(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "ffmpeg",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_ffmpeg", return_value=fake_stats) as mocked:
+        encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="ffmpeg",
+            start_time=5.5,
+            duration=30.0,
+        )
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["start_time"] == 5.5
+    assert kwargs["duration"] == 30.0
+
+
+def test_analyze_video_stream_uses_probe_data():
+    with patch("nano_hevc.encoder.probe_video_metadata") as probe_meta, patch(
+        "nano_hevc.encoder.probe_input_frame_types"
+    ) as probe_types:
+        probe_meta.return_value = {
+            "fps": 25.0,
+            "frame_count": 300,
+            "duration": 12.0,
+            "size": 1200000,
+        }
+        probe_types.return_value = ["I", "P", "B", "B"]
+
+        stats = analyze_video_stream(
+            "in.mp4",
+            start_time=2.0,
+            duration=4.0,
+            max_frames=3,
+        )
+
+    assert stats["bitrate_kbps"] == 800.0
+    assert stats["frame_types"] == ["I", "P", "B"]
+    assert stats["frame_type_counts"] == {"I": 1, "P": 1, "B": 1}
+    assert stats["segment_start"] == 2.0
+    assert stats["segment_duration"] == 4.0
 
 
 def test_nano_container_roundtrip_yuv(tmp_path):
