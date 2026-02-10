@@ -14,6 +14,7 @@ import json
 import os
 import struct
 import zlib
+import tempfile
 from fractions import Fraction
 import numpy as np
 
@@ -203,6 +204,118 @@ def compute_bitrate_kbps(total_bytes: int, duration_seconds: float) -> float:
     if duration_seconds <= 0:
         return 0.0
     return (total_bytes * 8.0) / duration_seconds / 1000.0
+
+
+def extract_raw_input_segment(
+    input_path: str,
+    output_raw_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    start_time: float | None = None,
+    duration: float | None = None,
+) -> None:
+    """
+    Extract a scaled YUV420p segment from input into a raw file.
+
+    For container inputs, ffmpeg is used.
+    For raw .yuv inputs, bytes are copied directly (start_time/duration ignored).
+    """
+    is_container_input = input_path.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+    if is_container_input:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+        ]
+        if start_time is not None and start_time > 0:
+            cmd.extend(["-ss", f"{start_time:.6f}"])
+        cmd.extend(["-i", input_path])
+        if duration is not None and duration > 0:
+            cmd.extend(["-t", f"{duration:.6f}"])
+        cmd.extend(
+            [
+                "-vf",
+                f"scale={width}:{height}",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if num_frames > 0:
+            cmd.extend(["-frames:v", str(num_frames)])
+        cmd.extend(["-f", "rawvideo", output_raw_path])
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return
+
+    frame_size = width * height * 3 // 2
+    with open(input_path, "rb") as src, open(output_raw_path, "wb") as dst:
+        if num_frames <= 0:
+            dst.write(src.read())
+            return
+        dst.write(src.read(frame_size * num_frames))
+
+
+def compute_decoded_luma_psnr(
+    input_path: str,
+    encoded_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    start_time: float | None = None,
+    duration: float | None = None,
+) -> dict:
+    """Decode encoded video and compute average luma PSNR versus input segment."""
+    with tempfile.TemporaryDirectory(prefix="nano_hevc_psnr_") as tmpdir:
+        src_raw = os.path.join(tmpdir, "src.yuv")
+        dec_raw = os.path.join(tmpdir, "dec.yuv")
+
+        extract_raw_input_segment(
+            input_path=input_path,
+            output_raw_path=src_raw,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            start_time=start_time,
+            duration=duration,
+        )
+
+        decode_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            encoded_path,
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        if num_frames > 0:
+            decode_cmd.extend(["-frames:v", str(num_frames)])
+        decode_cmd.extend(["-f", "rawvideo", dec_raw])
+        subprocess.run(decode_cmd, capture_output=True, text=True, check=True)
+
+        frame_size = width * height * 3 // 2
+        luma_size = width * height
+        src = np.fromfile(src_raw, dtype=np.uint8)
+        dec = np.fromfile(dec_raw, dtype=np.uint8)
+
+        frame_count = min(src.size // frame_size, dec.size // frame_size)
+        if frame_count <= 0:
+            return {"decoded_avg_psnr": 0.0, "decoded_frames": 0}
+
+        psnr_values = []
+        for i in range(frame_count):
+            src_y = src[i * frame_size : i * frame_size + luma_size]
+            dec_y = dec[i * frame_size : i * frame_size + luma_size]
+            psnr_values.append(psnr(src_y, dec_y))
+
+        return {
+            "decoded_avg_psnr": float(sum(psnr_values) / len(psnr_values)),
+            "decoded_frames": frame_count,
+        }
 
 
 def analyze_video_stream(
@@ -634,6 +747,7 @@ def encode_video_nano(
     standard_intra_only: bool = False,
     start_time: float | None = None,
     duration: float | None = None,
+    verify_decoded_psnr: bool = False,
 ) -> dict:
     """
     Encode video with nano backend.
@@ -664,6 +778,8 @@ def encode_video_nano(
         "total_blocks": 0,
         "avg_psnr": 0.0,
         "output_bitrate_kbps": 0.0,
+        "decoded_avg_psnr": 0.0,
+        "decoded_frames": 0,
         "encoded_frame_types": [],
         "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
         "input_frame_types": [],
@@ -895,6 +1011,17 @@ def encode_video_nano(
         total_stats["output_bitrate_kbps"] = (
             total_stats["total_bytes"] * 8.0 * input_fps_for_rate / total_stats["frames"] / 1000.0
         )
+    if verify_decoded_psnr and (standard_hevc_output or native_hevc_output):
+        decoded_stats = compute_decoded_luma_psnr(
+            input_path=input_path,
+            encoded_path=output_path,
+            width=width,
+            height=height,
+            num_frames=total_stats["frames"],
+            start_time=start_time,
+            duration=duration,
+        )
+        total_stats.update(decoded_stats)
     if standard_hevc_output and show_frame_types:
         try:
             encoded_frame_types = probe_input_frame_types(output_path)
@@ -1060,6 +1187,7 @@ def encode_video_ffmpeg(
     bitrate: str | None = None,
     start_time: float | None = None,
     duration: float | None = None,
+    verify_decoded_psnr: bool = False,
 ) -> dict:
     """
     Encode video using ffmpeg's HEVC encoders (production backend).
@@ -1154,12 +1282,25 @@ def encode_video_ffmpeg(
         "total_bytes": output_bytes,
         "total_blocks": 0,
         "avg_psnr": 0.0,
+        "decoded_avg_psnr": 0.0,
+        "decoded_frames": 0,
         "output_bitrate_kbps": compute_bitrate_kbps(output_bytes, output_duration),
         "encoded_frame_types": encoded_frame_types,
         "encoded_frame_type_counts": summarize_frame_types(encoded_frame_types),
         "input_frame_types": input_frame_types,
         "input_frame_type_counts": summarize_frame_types(input_frame_types),
     }
+    if verify_decoded_psnr:
+        decoded_stats = compute_decoded_luma_psnr(
+            input_path=input_path,
+            encoded_path=output_path,
+            width=width,
+            height=height,
+            num_frames=output_frame_count,
+            start_time=start_time,
+            duration=duration,
+        )
+        stats.update(decoded_stats)
     return stats
 
 
@@ -1186,6 +1327,7 @@ def encode_video(
     nano_native_hevc: bool = False,
     start_time: float | None = None,
     duration: float | None = None,
+    verify_decoded_psnr: bool = False,
 ) -> dict:
     """Unified entry point for nano or ffmpeg backend."""
     if backend == "nano":
@@ -1207,6 +1349,7 @@ def encode_video(
             standard_intra_only=nano_standard_intra_only,
             start_time=start_time,
             duration=duration,
+            verify_decoded_psnr=verify_decoded_psnr,
         )
     if backend == "ffmpeg":
         return encode_video_ffmpeg(
@@ -1222,6 +1365,7 @@ def encode_video(
             bitrate=ffmpeg_bitrate,
             start_time=start_time,
             duration=duration,
+            verify_decoded_psnr=verify_decoded_psnr,
         )
     raise ValueError(f"Unknown backend: {backend}")
 
@@ -1261,6 +1405,11 @@ def main():
         "--show-frame-types",
         action="store_true",
         help="Show input and encoded frame type statistics (I/P/B)",
+    )
+    parser.add_argument(
+        "--verify-decoded-psnr",
+        action="store_true",
+        help="Decode output and report actual luma PSNR against the encoded input segment",
     )
     parser.add_argument(
         "--backend",
@@ -1442,6 +1591,7 @@ def main():
         nano_native_hevc=args.nano_native_hevc,
         start_time=args.start_time if args.start_time > 0 else None,
         duration=args.duration,
+        verify_decoded_psnr=args.verify_decoded_psnr,
     )
 
     print()
@@ -1451,7 +1601,7 @@ def main():
         print(f"  Format:     {stats['output_format']}")
     print(f"  Total size: {stats['total_bytes']} bytes")
     if stats["backend"] == "nano":
-        print(f"  Avg PSNR:   {stats['avg_psnr']:.2f} dB")
+        print(f"  Recon PSNR(Y): {stats['avg_psnr']:.2f} dB")
 
     if stats["output_bitrate_kbps"] > 0:
         print(f"  Avg bitrate: {stats['output_bitrate_kbps']:.1f} kbps")
@@ -1469,6 +1619,10 @@ def main():
             print(
                 f"  Input frame types:   I={in_counts['I']} P={in_counts['P']} B={in_counts['B']}"
             )
+    if args.verify_decoded_psnr and stats.get("decoded_frames", 0) > 0:
+        print(
+            f"  Decoded PSNR(Y): {stats['decoded_avg_psnr']:.2f} dB over {stats['decoded_frames']} frames"
+        )
 
 
 if __name__ == "__main__":

@@ -169,7 +169,8 @@ uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
   -o /tmp/red_bull_first2min.nano.std.hevc \
   --width 640 --height 360 --frames 3000 --start-time 0 --duration 120 \
   --backend nano --qp 27 --fast --show-frame-types \
-  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28
+  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28 \
+  --verify-decoded-psnr
 ```
 
 Baseline standard HEVC directly from ffmpeg backend:
@@ -178,8 +179,15 @@ Baseline standard HEVC directly from ffmpeg backend:
 uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
   -o /tmp/red_bull_first2min.ffmpeg.hevc \
   --width 640 --height 360 --frames 3000 --start-time 0 --duration 120 \
-  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 --show-frame-types
+  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 --show-frame-types \
+  --verify-decoded-psnr
 ```
+
+`--verify-decoded-psnr` decodes the produced bitstream and reports actual luma
+PSNR against the encoded input segment, which is the reliable way to compare
+native vs standard output quality.
+Without this flag, the `nano` backend PSNR is reconstruction PSNR from the
+in-memory pipeline, not decoder-validated PSNR from the final bitstream.
 
 Compare bitrates:
 

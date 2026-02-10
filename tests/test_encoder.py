@@ -238,6 +238,41 @@ def test_encode_video_forwards_segment_flags_to_nano(tmp_path):
     assert kwargs["duration"] == 120.0
 
 
+def test_encode_video_forwards_verify_flag_to_nano(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "nano",
+        "output_format": "hevc",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "decoded_avg_psnr": 0.0,
+        "decoded_frames": 0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_nano", return_value=fake_stats) as mocked:
+        encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="nano",
+            verify_decoded_psnr=True,
+        )
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["verify_decoded_psnr"] is True
+
+
 def test_encode_video_forwards_nano_native_hevc_flag(tmp_path):
     input_path = tmp_path / "input.yuv"
     output_path = tmp_path / "output_native.hevc"
@@ -304,6 +339,40 @@ def test_encode_video_forwards_segment_flags_to_ffmpeg(tmp_path):
     kwargs = mocked.call_args.kwargs
     assert kwargs["start_time"] == 5.5
     assert kwargs["duration"] == 30.0
+
+
+def test_encode_video_forwards_verify_flag_to_ffmpeg(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "ffmpeg",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "decoded_avg_psnr": 0.0,
+        "decoded_frames": 0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_ffmpeg", return_value=fake_stats) as mocked:
+        encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="ffmpeg",
+            verify_decoded_psnr=True,
+        )
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["verify_decoded_psnr"] is True
 
 
 def test_analyze_video_stream_uses_probe_data():
