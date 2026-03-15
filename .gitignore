@@ -39,3 +39,6 @@ Thumbs.db
 examples/videos/*.mp4
 examples/videos/*.265
 examples/videos/*.hevc
+
+# Draft docs
+docs/hevc_binary_decoder_deepdive.md

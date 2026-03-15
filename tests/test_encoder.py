@@ -4,10 +4,12 @@ import subprocess
 from unittest.mock import patch
 
 from nano_hevc.cabac import CabacContext, CabacEncoder, init_contexts_for_slice
+from nano_hevc.frame import Frame, Plane
 from nano_hevc.encoder import (
     analyze_video_stream,
     compute_bitrate_kbps,
     decode_video_nano,
+    encode_frame,
     encode_video,
     iter_block_coords,
     parse_ratio_to_float,
@@ -139,6 +141,91 @@ def test_encode_video_reports_encoded_frame_types(tmp_path):
     assert stats["backend"] == "nano"
     assert stats["encoded_frame_types"] == ["I"]
     assert stats["encoded_frame_type_counts"] == {"I": 1, "P": 0, "B": 0}
+
+
+def test_encode_frame_native_intra_signals_residual_when_needed():
+    width, height = 16, 16
+    y = (np.arange(width * height, dtype=np.int16).reshape(height, width) + 16) % 256
+    u = np.full((height // 2, width // 2), 128, dtype=np.uint8)
+    v = np.full((height // 2, width // 2), 128, dtype=np.uint8)
+
+    frame = Frame(
+        y=Plane(y.astype(np.int16)),
+        u=Plane(u.astype(np.int16)),
+        v=Plane(v.astype(np.int16)),
+    )
+
+    encoded, _, stats = encode_frame(
+        frame=frame,
+        config=HEVCConfig(width=width, height=height, qp=12),
+        fast_mode=False,
+        native_minimal_syntax=True,
+    )
+
+    assert stats["frame_type"] == "I"
+    assert stats["cbf_count"] > 0
+    assert len(encoded) > 0
+    assert encoded.startswith(b"\x00\x00\x00\x01")
+
+
+def test_encode_frame_trace_includes_minimal_syntax_tokens():
+    width, height = 16, 16
+    y = (np.arange(width * height, dtype=np.int16).reshape(height, width) + 16) % 256
+    u = np.full((height // 2, width // 2), 128, dtype=np.uint8)
+    v = np.full((height // 2, width // 2), 128, dtype=np.uint8)
+
+    frame = Frame(
+        y=Plane(y.astype(np.int16)),
+        u=Plane(u.astype(np.int16)),
+        v=Plane(v.astype(np.int16)),
+    )
+
+    _encoded, _recon, stats = encode_frame(
+        frame=frame,
+        config=HEVCConfig(width=width, height=height, qp=12),
+        fast_mode=False,
+        native_minimal_syntax=True,
+        trace=True,
+    )
+
+    trace = stats["symbol_trace"]
+    token_types = {token.token_type for token in trace}
+    assert "split_cu_flag" in token_types
+    assert "part_mode" in token_types
+    assert "intra_luma_pred_mode" in token_types
+    assert "intra_chroma_pred_mode" in token_types
+    assert "cbf_luma" in token_types
+
+
+def test_encode_video_with_experimental_native_inter_produces_frame_types(tmp_path):
+    width, height = 16, 16
+    frame_size = width * height * 3 // 2
+    frame0 = bytes([16]) * frame_size
+    frame1 = bytes([48]) * frame_size
+    frame2 = bytes([80]) * frame_size
+    frame3 = bytes([112]) * frame_size
+
+    input_path = tmp_path / "input_4f.yuv"
+    output_path = tmp_path / "output_4f_native.hevc"
+    input_path.write_bytes(frame0 + frame1 + frame2 + frame3)
+
+    stats = encode_video(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        width=width,
+        height=height,
+        num_frames=4,
+        qp=27,
+        fast_mode=True,
+        backend="nano",
+        nano_native_hevc=True,
+        nano_native_inter=True,
+        nano_native_gop_size=4,
+        nano_native_search_range=2,
+    )
+
+    assert stats["encoded_frame_types"] == ["I", "P", "B", "P"]
+    assert stats["encoded_frame_type_counts"] == {"I": 1, "P": 2, "B": 1}
 
 
 def test_encode_video_unknown_backend_raises(tmp_path):
@@ -305,6 +392,44 @@ def test_encode_video_forwards_nano_native_hevc_flag(tmp_path):
     assert stats["output_format"] == "hevc_native"
     kwargs = mocked.call_args.kwargs
     assert kwargs["native_hevc_output"] is True
+
+
+def test_encode_video_forwards_nano_native_inter_options_to_nano(tmp_path):
+    input_path = tmp_path / "input.yuv"
+    output_path = tmp_path / "output_native_inter.hevc"
+    input_path.write_bytes(bytes(16 * 16 * 3 // 2))
+
+    fake_stats = {
+        "backend": "nano",
+        "output_format": "hevc_native",
+        "frames": 0,
+        "total_bytes": 0,
+        "total_blocks": 0,
+        "avg_psnr": 0.0,
+        "output_bitrate_kbps": 0.0,
+        "encoded_frame_types": [],
+        "encoded_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+        "input_frame_types": [],
+        "input_frame_type_counts": {"I": 0, "P": 0, "B": 0},
+    }
+
+    with patch("nano_hevc.encoder.encode_video_nano", return_value=fake_stats) as mocked:
+        encode_video(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=16,
+            height=16,
+            backend="nano",
+            nano_native_hevc=True,
+            nano_native_inter=True,
+            nano_native_gop_size=7,
+            nano_native_search_range=9,
+        )
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["native_inter"] is True
+    assert kwargs["native_gop_size"] == 7
+    assert kwargs["native_search_range"] == 9
 
 
 def test_encode_video_forwards_segment_flags_to_ffmpeg(tmp_path):

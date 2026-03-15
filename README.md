@@ -22,8 +22,13 @@ The code prioritizes clarity and readability over performance.
 - [x] Native HEVC output mode from nano backend (experimental)
 - [x] CABAC entropy coding core (coefficients + CBF, arithmetic engine tested)
 - [x] NAL unit generation (VPS/SPS/PPS/Slice)
-- [ ] Full native HEVC-compliant intra-only bitstream from nano backend
-- [ ] Inter prediction / motion estimation (P/B coding)
+- [x] Full native HEVC-compliant intra-only bitstream from nano backend
+  - [x] Keep native CABAC path for all intra blocks
+  - [x] Encode CBF and residual coefficients for non-zero blocks
+- [x] Inter prediction / motion estimation (P/B coding)
+  - [x] Add full-search motion estimation for luma blocks
+  - [x] Add simple experimental P/B frame scheduling + reference list
+  - [x] Add CLI/API options for native inter and GOP/search controls
 
 ## Installation
 
@@ -118,9 +123,19 @@ uv run python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp
 This mode is syntax-level experimental: the stream is decodable by standard
 HEVC decoders, but coding syntax is still incomplete and visual fidelity is
 not yet at production quality.
-Current native mode prioritizes bitstream stability (minimal intra syntax with
-zero-residual signaling), so quality/efficiency can differ from the `nano`
-reconstruction stats.
+Current native mode now keeps a full intra residual path (no forced zero CBF), so
+`cbf` and coefficients are carried when non-zero and are still decoded by the
+same experimental pathway. Quality/efficiency remains educational.
+
+For native experimental inter coding:
+
+```bash
+uv run python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
+  -o /tmp/red_bull_first2min.nano.native.inter.hevc \
+  --width 640 --height 360 --frames 300 \
+  --backend nano --qp 27 --fast --nano-native-hevc --nano-native-inter \
+  --nano-native-gop-size 30 --nano-native-search-range 8
+```
 
 Decode `nano` container back to YUV/MP4:
 

@@ -5,7 +5,7 @@ Implements the entropy coding engine per ITU-T H.265 Section 9.3.
 """
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, NamedTuple
 import numpy as np
 
 from nano_hevc.bitstream import BitstreamWriter
@@ -232,9 +232,26 @@ class CabacContext:
             self.mps = 0
 
 
-class CabacEncoder:
-    """CABAC arithmetic encoder."""
 
+class SymbolTrace(NamedTuple):
+    """One C_symbol-level trace entry.
+
+    Each instance records a single syntax element emitted during encoding.
+    The (poc, cu_x, cu_y, cu_size, plane) fields locate it spatially;
+    token_type + value define the prediction target.
+    """
+
+    poc: int
+    cu_x: int
+    cu_y: int
+    cu_size: int
+    plane: str  # "Y", "U", "V"
+    token_type: str  # e.g. "cbf_luma", "last_sig_coeff_x", "sig_coeff_flag"
+    value: int  # the actual syntax element value
+    vocab_size: int  # how many possible values this token type can take
+
+class CabacEncoder:
+    """CABAC arithmetic encoder with optional C_symbol tracing."""
     __slots__ = (
         "_low",
         "_range",
@@ -242,15 +259,42 @@ class CabacEncoder:
         "_buffer",
         "_num_buffered_bytes",
         "_buffered_byte",
+        "_trace",
+        "_trace_log",
+        "_trace_pos",
     )
 
-    def __init__(self):
+    def __init__(self, trace: bool = False):
         self._low = 0
         self._range = 510
         self._bits_left = 23
         self._buffer: List[int] = []
         self._num_buffered_bytes = 0
         self._buffered_byte = 0xFF
+        self._trace = trace
+        self._trace_log: List[SymbolTrace] = []
+        self._trace_pos: dict = {}  # set by caller: {poc, cu_x, cu_y, cu_size, plane}
+
+    def trace_symbol(self, token_type: str, value: int, vocab_size: int) -> None:
+        """Record a C_symbol-level token (only when tracing is enabled)."""
+        if not self._trace:
+            return
+        p = self._trace_pos
+        self._trace_log.append(SymbolTrace(
+            poc=p.get("poc", 0),
+            cu_x=p.get("cu_x", 0),
+            cu_y=p.get("cu_y", 0),
+            cu_size=p.get("cu_size", 0),
+            plane=p.get("plane", "Y"),
+            token_type=token_type,
+            value=value,
+            vocab_size=vocab_size,
+        ))
+
+    @property
+    def symbol_trace(self) -> List[SymbolTrace]:
+        """Return collected symbol trace entries."""
+        return self._trace_log
 
     def encode_bin(self, bin_val: int, ctx: CabacContext) -> None:
         """Encode a single bin using context."""
@@ -365,6 +409,8 @@ class CabacEncoder:
         self._buffer = []
         self._num_buffered_bytes = 0
         self._buffered_byte = 0xFF
+        self._trace_log = []
+        self._trace_pos = {}
 
 
 def init_contexts_for_slice(slice_type: int, qp: int) -> dict:
