@@ -665,4 +665,526 @@ gate_weight = MLP(gate_input)  # 输出 per-patch 重要性
 
 ---
 
+## 9. OneVision-Encoder 现有实现：完整 Pipeline 记录
+
+本章记录 OneVision-Encoder 当前代码库中，从 HEVC 比特流到 ViT 输出的完整数据流。所有代码引用均精确到文件和行号。
+
+### 9.1 系统总览：Codec-Conditioned Token Pruner
+
+OneVision-Encoder 的核心思想是：**不从少量帧中密集采样所有 patch，而是从大量帧中稀疏采样重要的 patch。**
+
+"重要性"由 HEVC 编码器的副产品（运动向量 + 残差）决定。整体架构可以概括为一句话：
+
+> 一个 **codec-conditioned token pruner** -- 用 HEVC 解码器的 `|MV_L0|` 幅度 + `|residual|` 能量作为固定启发式显著性先验，执行 top-K 稀疏 patch 选择，然后送入 24 层 ViT。
+
+完整 pipeline：
+
+```
+HEVC bitstream
+     │
+     ▼
+┌─────────────┐
+│  C binary    │  openHEVC decoder (dataloader/decoder/bin/hevc)
+│  (stdout)    │  输出：YUV + MV_L0/L1 + ref_off + CU_size + meta + residual
+└──────┬──────┘
+       │ 二进制流 (4×H×W bytes/frame)
+       ▼
+┌─────────────┐
+│ HevcFeature  │  Python reader (dataloader/hevc_feature_decoder_mv.py)
+│ Reader       │  解析 → frame_tuple (11 fields) + meta dict
+└──────┬──────┘
+       │ (frame_type, quadtree, rgb, mvx_L0, mvy_L0, ..., residual)
+       ▼
+┌─────────────────────────────────────────────────┐
+│ Energy Pipeline                                  │
+│  (dataloader/ap_dataloader_dali_codec.py)        │
+│                                                  │
+│  1. _mv_energy_norm()     → MV 能量 [0,1]        │
+│  2. _residual_energy_norm() → 残差能量 [0,1]      │
+│  3. _fuse_energy()         → 融合能量 [0,1]       │
+│  4. _apply_center_prior()  → 加中心先验           │
+│  5. compute_visible_indices_cpu() → top-K 索引    │
+└──────┬──────────────────────────────────────────┘
+       │ visible_indices: np.ndarray(int32, shape=(K,))
+       ▼
+┌─────────────────────────────────────────────────┐
+│ Training Loop                                    │
+│  (training/train.py)                             │
+│                                                  │
+│  3-Strategy Batch Mixing:                        │
+│    residual (40%) | frame_sampling (40%) | collage (20%)
+│                                                  │
+│  Patchify → Gather by visible_indices → ViT      │
+└──────┬──────────────────────────────────────────┘
+       │ selected patches: [B, 3, T', H, W]
+       ▼
+┌─────────────────────────────────────────────────┐
+│ OneVisionEncoderModel                            │
+│  (onevision_encoder/modeling_onevision_encoder.py)
+│                                                  │
+│  Conv2d patch_embed → gather(visible_indices)    │
+│  → 3D RoPE (4:6:6 split T:H:W)                  │
+│  → 24-layer Transformer (FlashAttention)         │
+│  → Multi-Head Attention Pooling → embedding      │
+└─────────────────────────────────────────────────┘
+```
+
+### 9.2 Step 1: HEVC 特征读取
+
+**文件**: `dataloader/hevc_feature_decoder_mv.py`
+**核心类**: `HevcFeatureReader` (line 439)
+
+#### 9.2.1 启动 C Binary
+
+`HevcFeatureReader.__init__()` 通过 `subprocess.Popen` 启动 C binary，将 HEVC 比特流文件作为输入参数，捕获 stdout 作为二进制数据流：
+
+```python
+# hevc_feature_decoder_mv.py, HevcFeatureReader.__init__()
+self.process = sp.Popen(
+    [hevc_binary_path, video_path],
+    stdout=sp.PIPE, stderr=sp.PIPE
+)
+```
+
+环境变量 `HEVC_FEAT_DECODER` 控制 binary 路径（默认 `../dataloader/decoder/bin/hevc`）。`UMT_HEVC_Y_ONLY=1`（默认）使 reader 只提取 Y 通道。
+
+#### 9.2.2 逐帧二进制解析
+
+`_read_frame_data()` (line 572) 从 stdout 按固定顺序读取每帧数据（详见第 2 章），返回原始 buffer。
+
+`_readFrame()` (line 667) 将 buffer 转换为结构化的 `frame_tuple`：
+
+```python
+frame_tuple = (
+    frame_type,      # [0] int: 0=IDR, 1=CRA, 2=P, 3=B
+    quadtree_stru,   # [1] ← 读取但后续未使用
+    rgb,             # [2] Y-only grayscale 或 BGR
+    mv_x_L0,         # [3] int16, (H/4, W/4)  ← 核心输入
+    mv_y_L0,         # [4] int16, (H/4, W/4)  ← 核心输入
+    mv_x_L1,         # [5] ← 读取但后续未使用
+    mv_y_L1,         # [6] ← 读取但后续未使用
+    ref_off_L0,      # [7] ← 读取但后续未使用
+    ref_off_L1,      # [8] ← 读取但后续未使用
+    size,            # [9] ← 读取但后续未使用
+    residual,        # [10] uint8, centered at 128  ← 核心输入
+)
+```
+
+#### 9.2.3 帧迭代器
+
+`nextFrameEx()` (line 808) 是主要的公共接口，作为 generator 逐帧 yield `(frame_tuple, meta_dict)`。它维护了 GOP 边界追踪、I 帧检测启发式、帧索引计数等状态。
+
+```python
+for frame_tuple, meta in reader.nextFrameEx():
+    frame_type = meta["frame_type"]      # 0=IDR, 1=CRA, 2=P, 3=B
+    is_i = meta["is_i_frame"]            # bool
+    # ... 处理每帧
+```
+
+### 9.3 Step 2: 能量计算与融合
+
+**文件**: `dataloader/ap_dataloader_dali_codec.py`
+
+#### 9.3.1 MV 能量归一化
+
+**函数**: `_mv_energy_norm()` (line 573-633)
+
+输入 `mvx_L0`、`mvy_L0`（int16, quarter-pel），输出归一化到 [0,1] 的 H×W 能量图。
+
+**完整处理链**：
+
+```
+mvx, mvy (int16, quarter-pel, H/4 × W/4)
+  │
+  ▼  除以 mv_unit_div=4.0，转换为像素单位
+vx, vy (float32, pixel, H/4 × W/4)
+  │
+  ▼  全局运动补偿（可选，默认 "none"）
+  │   • "median" : 减去全帧 MV 中位数（去平移）
+  │   • "mean"   : 减去全帧 MV 均值
+  │   • "similarity": 拟合全局相似变换模型（平移+旋转+等比缩放），减去相机运动场
+  │   • "affine" : 拟合全局仿射模型（+各向异性缩放+剪切）
+  │
+  ▼  计算幅度
+mag = sqrt(vx² + vy²)  (float32, H/4 × W/4)
+  │
+  ▼  可选：局部方差模式 (use_inconsistency=True)
+  │   score = local_var(mag, ksize=3)  -- 用邻域方差替代裸幅度
+  │
+  ▼  百分位归一化
+a = percentile(score, 95)
+norm = clip(score / a, 0, 1)  (float32, H/4 × W/4)
+  │
+  ▼  上采样到 H × W（最近邻插值）
+norm_HxW (float32, H × W)
+```
+
+**全局运动补偿的实现** (`_mv_fit_global_model`, line 110-179):
+- 构建坐标网格的设计矩阵 A（归一化到 [-1,1]）
+- 迭代 trimmed least squares：拟合 → 计算残差 → 保留残差最小的 70% → 重拟合
+- 回退机制：有效点 < 64 或拟合失败时退化为中位数平移
+- 结果缓存在进程级 `_MV_GLOBAL_DESIGN_CACHE` 中
+
+#### 9.3.2 残差能量归一化
+
+**函数**: `_residual_energy_norm()` (line 221-235)
+
+输入 uint8 残差图（centered at 128），输出归一化到 [0,1] 的能量图。
+
+```
+res_y (uint8, H × W, centered at 128)
+  │
+  ▼  默认模式：绝对偏差
+x = |res_y.float() - 128.0|  (float32, H × W)
+  │
+  ▼  可选模式 (use_grad=True)：梯度能量
+  │   gx = |roll(res, -1, axis=1) - roll(res, 1, axis=1)|
+  │   gy = |roll(res, -1, axis=0) - roll(res, 1, axis=0)|
+  │   x = 0.5 * (gx + gy)   -- 边缘/结构能量，比纯幅度更抗噪声
+  │
+  ▼  百分位归一化
+a = percentile(x, 95)
+norm = clip(x / a, 0, 1)  (float32, H × W)
+```
+
+#### 9.3.3 能量融合
+
+**函数**: `_fuse_energy()` (line 181-193)
+
+将 MV 和残差两个 [0,1] 能量图融合为一个：
+
+```python
+# 4 种模式：
+"weighted" (默认): fused = (w_mv * mv + w_res * res) / (w_mv + w_res)
+"max"             : fused = max(mv, res)
+"sum"             : fused = clip(mv + res, 0, 1)
+"geomean"         : fused = sqrt(mv * res)
+```
+
+默认 `w_mv=1.0, w_res=1.0`，即 50/50 等权融合。
+
+#### 9.3.4 中心先验
+
+**函数**: `_apply_center_prior()` (line 196-219)
+
+在融合能量图上叠加一个 2D 高斯中心偏置：
+
+```python
+# 参数：center_prior (强度), center_sigma (宽度, 相对于短边)
+sigma = center_sigma * min(H, W)  # 默认 0.35
+w = exp(-0.5 * ((x-cx)² + (y-cy)²) / sigma²)
+out = fused * (1.0 + center_prior * w)
+```
+
+这个偏置假设"视频中心区域更重要"。对于大多数自然视频这是合理的，但对 vlog、监控等非中心构图的视频会引入 bias。
+
+#### 9.3.5 I 帧处理
+
+I 帧没有运动向量，残差也没有帧间含义。当前实现直接将 I 帧的能量图设为全零：
+
+```python
+# ap_dataloader_dali_codec.py, line 802-808
+if pos in I_pos_set:
+    residuals_y[pos] = np.zeros((H0, W0), dtype=dtype0 or np.uint8)
+```
+
+这意味着 I 帧的 patch 选择完全依赖后续的 static fallback 机制（均匀采样），没有任何编码器先验指导。
+
+### 9.4 Step 3: Top-K Patch 选择
+
+**函数**: `compute_visible_indices_cpu()` (line 285-468)
+
+将融合后的 per-pixel 能量图转换为 per-patch 分数，然后选择分数最高的 K 个 patch。
+
+#### 9.4.1 Patch 分数计算
+
+```python
+# line 350-361
+# residuals_y: (F, H, W) -- 所有帧的融合能量图，已经 resize+crop 到 input_size
+# F=帧数, H=W=224 (input_size)
+# patch_size=14, 所以 hb=wb=16, patches_per_frame=256
+# L = F * hb * wb = F * 256 = 总 patch 数
+
+res_abs = np.abs(residuals_y)                          # (F, H, W)
+res_reshaped = res_abs.reshape(F, hb, ph, wb, pw)      # (F, 16, 14, 16, 14)
+patch_scores = res_reshaped.sum(axis=(2, 4))            # (F, 16, 16) -- 每 patch 内像素能量之和
+patch_scores_flat = patch_scores.reshape(L)             # (L,) -- 展平为一维
+```
+
+**关键洞察**：patch score = patch 内所有像素的融合能量之和。这是一个无参数的固定启发式，不可训练。
+
+#### 9.4.2 Static Video Fallback
+
+**Line 363-462** -- 检测静态/低能量视频并切换到混合策略：
+
+```python
+# 检测条件（二选一触发）：
+is_static = (p95 < abs_thresh)                            # 绝对低能量
+           or (p95 < abs_thresh*2 and rel_contrast < 0.15) # 低能量+低对比度
+
+# 如果触发 static fallback:
+# 1. 均匀选 4 帧（默认），取所有 patch
+# 2. 剩余 budget 用 top-K 从其他帧补
+# 3. 合并、去重、排序
+```
+
+这个 fallback 解决了一个现实问题：对于几乎静止的视频（如幻灯片、文档阅读），MV 和残差都接近零，top-K 退化为随机选择。Fallback 确保至少均匀覆盖几帧。
+
+#### 9.4.3 标准 Top-K
+
+对于非静态视频，直接做 `argpartition`：
+
+```python
+# line 465-466
+topk_indices = np.argpartition(patch_scores_flat, -K)[-K:]
+visible_indices = np.sort(topk_indices).astype(np.int32)  # (K,)
+```
+
+输出是 K 个 patch 的线性索引（在 F×hb×wb 空间中），升序排列。
+
+#### 9.4.4 数值示例
+
+典型配置：`F=64 帧, H=W=224, patch_size=14, K=2048`
+
+```
+总 patch 数 L = 64 × 16 × 16 = 16,384
+选择 K = 2,048 个 patch
+压缩比 = 2048 / 16384 = 12.5%（丢弃 87.5% 的 patch）
+
+相当于：从 64 帧中只保留 8 帧等量的 patch
+但分布是跨帧稀疏的：运动/变化区域的 patch 被保留，静态区域被丢弃
+```
+
+### 9.5 Step 4: 训练策略
+
+**文件**: `training/train.py`
+**核心逻辑**: Line 532-655
+
+每个 batch 内部按比例混合 3 种 patch 选择策略：
+
+#### 9.5.1 三策略混合
+
+| 策略 | 比例 | 含义 | 实现 |
+|------|------|------|------|
+| **residual** | 40% (n1) | 使用 HEVC 编码器先验选 patch | 直接用 `visible_indices` from top-K |
+| **frame_sampling** | 40% (n2-n1) | 随机选 8 帧，取全部 patch | 随机帧偏移 + 固定帧内全覆盖 |
+| **collage** | 20% (bs-n2) | 8 帧拼成一张大图，走标准 ViT | 竖向拼接 → (3, 1792, 224) 作为 "图像" |
+
+```python
+# train.py, line 542-548
+n1 = int(bs * args.residual_ratio)     # = int(8 * 0.4) = 3
+n2 = n1 + int(bs * args.frame_sampling_ratio)  # = 3 + int(8 * 0.4) = 6
+# collage: bs - n2 = 8 - 6 = 2
+
+# 前 3 个样本：用 HEVC top-K visible_indices
+# 中间 3 个样本：随机帧采样，每帧全部 256 patch
+# 最后 2 个样本：8 帧拼大图，走标准 dense ViT
+```
+
+#### 9.5.2 Residual 策略（HEVC 驱动）
+
+```python
+# train.py, line 556-557
+if has_residual:
+    out[mask_residual] = visible_indices[mask_residual, :]  # 直接使用预计算的 top-K 索引
+```
+
+这是 codec pipeline 的核心路径。`visible_indices` 来自 `compute_visible_indices_cpu()`，而该函数的输入能量来自 HEVC C binary 的 MV + residual。
+
+#### 9.5.3 Frame Sampling 策略（时间均匀）
+
+```python
+# train.py, line 560-567
+# 从 64 帧的时间范围划分为 8 个 bin（每 bin 8 帧）
+# 每个 bin 随机选 1 帧，取该帧的全部 256 个 patch
+frame_offsets = torch.randint(sampling_bin, (nB, args.num_frames), device=...)
+frames = (frame_bin_starts + frame_offsets).clamp(max=63)
+patch_indices = frame_token_offsets[frames].reshape(nB, -1)  # (nB, 2048)
+```
+
+这保证了时间维度的均匀覆盖，但空间上没有选择性 -- 每帧所有 patch 都保留。
+
+#### 9.5.4 Collage 策略（大图 ViT）
+
+```python
+# train.py, line 618-645
+# 随机选 8 帧，竖向拼接成 (3, 1792, 224) 的 "大图"
+grid = torch.cat(grid_rows, dim=-2)  # [nC, 3, 1792, 224]
+collage_head_output = backbone(grid)  # 标准 dense ViT forward
+```
+
+Collage 完全绕过 visible_indices，把多帧视频伪装成一张超高图像，让 ViT 自己决定哪些区域重要。这提供了一个不依赖 codec 先验的对照学习信号。
+
+#### 9.5.5 Patchify + Gather
+
+对于 residual 和 frame_sampling 策略，训练代码先 patchify 整个 64 帧视频，然后按 `visible_indices` gather 选中的 patch：
+
+```python
+# train.py, line 578-589
+# Patchify: [B, 3, 64, 224, 224] → [B, 3, 16384, 14, 14]
+patches = video.view(n, C, T, Hp, patch_size, Wp, patch_size)
+                .permute(0,1,2,3,5,4,6)
+                .reshape(n, C, T*Hp*Wp, patch_size, patch_size)
+
+# Gather selected patches: [B, 3, 2048, 14, 14]
+idx = vis_idx[:, None, :, None, None].expand(-1, C, -1, patch_size, patch_size)
+selected = torch.gather(patches, 2, idx)
+
+# Unpatchify back to video format: [B, 3, 8, 224, 224]
+# 2048 patches / 256 per frame = 8 虚拟帧
+combined_head_input = selected.view(n, C, T_new, Hp, Wp, patch_size, patch_size)
+                              .permute(0,1,2,3,5,4,6)
+                              .reshape(n, C, T_new, H, W)
+```
+
+**关键点**：虽然输入是 64 帧，但 gather 之后只有 2048 个 patch（等价于 8 帧的 token 数量）。这些 patch 来自时空中最"有趣"的位置，由 HEVC 编码器决定。
+
+### 9.6 Step 5: ViT 模型
+
+**文件**: `onevision_encoder/modeling_onevision_encoder.py`
+**核心类**: `OneVisionEncoderModel` (line 552)
+
+#### 9.6.1 模型架构
+
+| 组件 | 规格 |
+|------|------|
+| Patch Embedding | Conv2d(3, 1024, kernel=14, stride=14) -- 无 bias |
+| Pre-Norm | LayerNorm(1024) |
+| Encoder | 24 层 Transformer，每层 16 头 FlashAttention |
+| Position Encoding | 3D RoPE，4:6:6 split (T:H:W) |
+| Pooling Head | Learned probe (PMA-style) + MHA + RMSNorm + MLP |
+| Output | pooler_output: (B, 1024) embedding |
+
+#### 9.6.2 3D RoPE 位置编码
+
+**类**: `VideoRotaryEmbeddingSplit466` (line 105-197)
+
+head_dim=64，取一半=32 维用于 RoPE。按 4:6:6 比例分配给 T/H/W：
+
+```python
+unit = 32 // 16 = 2
+t_size = 4 * 2 = 8   维给时间
+h_size = 6 * 2 = 12  维给高度
+w_size = 6 * 2 = 12  维给宽度
+```
+
+对于每个 patch，根据其 (t, h, w) 位置计算频率：
+
+```python
+freqs = concat([
+    outer(t_positions, inv_freq_t),  # (L, 8)
+    outer(h_positions, inv_freq_h),  # (L, 12)
+    outer(w_positions, inv_freq_w),  # (L, 12)
+], dim=-1)  # (L, 32)
+
+# 然后拼接自身：(L, 32) → (L, 64) 用于 cos/sin 旋转
+freqs_visible = cat([freqs, freqs], dim=-1)
+```
+
+**与 visible_indices 的交互** (line 624-663):
+
+- **Dense path** (`visible_indices=None`): 为所有 T×Hp×Wp 个 patch 生成 RoPE，直接使用
+- **Sparse path** (`visible_indices` 提供): 
+  - 如果同时提供 `patch_positions`（显式 [t,h,w] 坐标），用 `forward_from_positions()` 直接计算
+  - 否则生成完整 RoPE 再 index gather
+
+#### 9.6.3 Sparse Patch Gather
+
+模型 forward 中的稀疏 gather (line 657-663):
+
+```python
+# 当 visible_indices 提供且 num_visible < total_patches 时：
+hidden_states = hidden_states.gather(
+    1, visible_indices.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+)
+# hidden_states: (B, total_patches, D) → (B, K, D)
+```
+
+这是整个 codec pipeline 的终点：从 16384 个 patch embedding 中 gather 出 2048 个，配上对应的 3D RoPE 位置编码，送入 24 层 Transformer。
+
+#### 9.6.4 Attention Pooling
+
+**类**: `Siglip2MultiheadAttentionPoolingHead` (line 200-223)
+
+```python
+# 一个可学习的 probe token 对所有 patch 做 cross-attention
+probe = self.probe.repeat(batch_size, 1, 1)  # (B, 1, D)
+attn_output, _ = self.attention(probe, hidden_states, hidden_states)  # Q=probe, K=V=patches
+# → (B, 1, D) → residual + RMSNorm + MLP → squeeze → (B, D)
+```
+
+最终输出一个 (B, 1024) 的 embedding，用于下游的 PartialFC 分类头。
+
+### 9.7 Step 6: 离线预计算 Pipeline
+
+**文件**: `tools/tools_for_hevc/step3_generate_video_mv_residual_index.py`
+
+除了在线 pipeline，还有一个离线批量版本用于预计算 `visible_indices`，避免训练时重复运行 HEVC decoder。
+
+**核心函数**: `process_one_video_mv_res()` (line 227-340)
+
+与在线版本逻辑完全一致，但：
+- 不需要 DALI pipeline
+- 输出写入 `.npy` 文件
+- 支持分布式执行（`RANK/WORLD_SIZE` 分片）
+
+```python
+# 离线版的核心循环（简化）：
+rdr = HevcFeatureReader(video_path)
+for frame_tuple, meta in rdr.nextFrameEx():
+    mvx_L0, mvy_L0 = frame_tuple[3], frame_tuple[4]
+    residual = frame_tuple[10]
+    
+    # I 帧 → 零能量
+    # P/B 帧 → _mv_energy_norm + _residual_energy_norm + _fuse_energy
+    ...
+
+# Resize + crop → patch scores → top-K → visible_indices
+visible_indices = mask_by_residual_topk(fused_tensor, K, patch_size)
+```
+
+**`mask_by_residual_topk()`** (line 207-225) 是 PyTorch 版本的 top-K，用于离线批处理：
+
+```python
+# res_torch: (B, 1, T, H, W) -- T=seq_len, H=W=224
+scores = res_abs.reshape(B, T, hb, ph, wb, pw).sum(dim=(3,5)).reshape(B, L)
+topk_idx = torch.topk(scores, k=K, largest=True, sorted=False).indices
+visible_indices = torch.sort(topk_idx, dim=1).values  # (B, K)
+```
+
+### 9.8 缓存机制
+
+**文件**: `dataloader/ap_dataloader_dali_codec.py`, line 493-571
+
+在线 pipeline 支持 `visible_indices` 的 pkl 缓存：
+
+```python
+# cache key 包含所有影响结果的参数：
+cache_key = f"K{K}_mvcomp{compensate}_mvincon{incon}_ks{ksize}_resgrad{grad}" \
+            f"_dup{dup}_cp{center_prior}_cs{center_sigma}" \
+            f"_st{static}_sta{abs_thresh}_str{rel_thresh}_stf{uniform_frames}"
+
+# 训练时：
+# 1. 先查 cache（get_cache）
+# 2. cache miss → 跑完整 HEVC pipeline → save_cache
+# 3. cache hit → 跳过 HEVC pipeline，直接加载 visible_indices（只读 decord 像素）
+```
+
+缓存命中时，`get_frame_id_list_simple()` (line 940-947) 只用 decord 读像素，完全跳过 HEVC C binary 和能量计算，训练吞吐量大幅提升。
+
+### 9.9 限制总结
+
+| 限制 | 位置 | 影响 |
+|------|------|------|
+| 仅用 MV L0 | `get_frame_id_list`, line 812 | B 帧后向运动完全忽略 |
+| I 帧零能量 | line 802-808 | I 帧 patch 选择退化为均匀/随机 |
+| 非可微门控 | `_fuse_energy` 是 numpy 硬编码 | 无法端到端优化 patch 选择 |
+| 固定 K budget | `K_keep` 硬编码 | 所有视频无论复杂度统一 2048 token |
+| 帧内百分位归一化 | `percentile(score, 95)` 每帧独立 | 跨帧能量不可比：帧 A 的 0.5 ≠ 帧 B 的 0.5 |
+| 帧独立打分 | 每帧独立计算能量 | 无跨帧时序连贯性：相邻帧可能选完全不同的区域 |
+| MV 幅度 ≠ 语义重要性 | 核心假设 | 快速相机摇移时全帧 MV 大但无语义变化 |
+| quadtree/CU/L1/ref 未使用 | frame_tuple[1,5-9] | 6 个已提取字段被浪费 |
+
+---
+
 *文档基于 `OneVision-Encoder/dataloader/hevc_feature_decoder_mv.py` 的完整逆向工程分析。C binary 基于 openHEVC（FFmpeg HEVC 解码器分支），预编译为 Linux/ARM 架构。*
