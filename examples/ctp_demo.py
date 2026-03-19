@@ -44,19 +44,56 @@ def load_video_frames(
     height: int,
     fps: int = 8,
 ) -> list[Frame]:
-    """Load frames via Decord and convert RGB -> YUV420 Frame objects.
+    """Load frames via PyAV and convert RGB -> YUV420 Frame objects.
 
     Replicates the segment-selection and frame-stepping logic from
     lwm/data.py:load_video_frames so the two pipelines see identical
     frame sequences given the same random state.
+
+    Backend priority: decord (LWM default) -> av (PyAV, portable fallback).
     """
+    try:
+        return _load_frames_decord(video_path, num_frames, width, height, fps)
+    except ImportError:
+        pass
+    return _load_frames_pyav(video_path, num_frames, width, height, fps)
+
+
+def _load_frames_decord(video_path, num_frames, width, height, fps):
     from decord import VideoReader, cpu
 
     vr = VideoReader(str(video_path), ctx=cpu(0))
     total = len(vr)
     video_fps = vr.get_avg_fps() or 30.0
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+    batch = vr.get_batch(indices).asnumpy()  # (N, H, W, 3) uint8
+    return [_resize_and_convert(rgb, width, height) for rgb in batch]
 
-    step = max(1, round(video_fps / fps))
+
+def _load_frames_pyav(video_path, num_frames, width, height, fps):
+    import av
+
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
+    total = stream.frames or 0
+    video_fps = float(stream.average_rate or 30)
+
+    # decode all frames into list, then index
+    all_frames = []
+    for frame in container.decode(video=0):
+        all_frames.append(frame.to_ndarray(format="rgb24"))
+    container.close()
+
+    if not total:
+        total = len(all_frames)
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+    return [_resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
+            for i in indices]
+
+
+def _pick_indices(total, video_fps, num_frames, target_fps):
+    """LWM-style segment selection: random start, fps stepping, pad short videos."""
+    step = max(1, round(video_fps / target_fps))
     total_available = total // step
 
     if total_available > num_frames:
@@ -70,17 +107,15 @@ def load_video_frames(
     ]
     while len(indices) < num_frames:
         indices.append(indices[-1])
+    return indices
 
-    batch = vr.get_batch(indices).asnumpy()  # (N, H, W, 3) uint8
 
-    frames: list[Frame] = []
-    for rgb in batch:
-        if rgb.shape[0] != height or rgb.shape[1] != width:
-            t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
-            t = F.interpolate(t, size=(height, width), mode="bicubic", align_corners=False)
-            rgb = t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
-        frames.append(_rgb_to_yuv420(rgb, width, height))
-    return frames
+def _resize_and_convert(rgb, width, height):
+    if rgb.shape[0] != height or rgb.shape[1] != width:
+        t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
+        t = F.interpolate(t, size=(height, width), mode="bicubic", align_corners=False)
+        rgb = t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
+    return _rgb_to_yuv420(rgb, width, height)
 
 
 def _rgb_to_yuv420(rgb: np.ndarray, w: int, h: int) -> Frame:
