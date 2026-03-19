@@ -273,18 +273,50 @@ def load_frames_from_lance(
     return all_frames, sources
 
 
-def _decode_video_bytes(raw_bytes, num_frames, width, height, fps):
+def _ffmpeg_threads(num_workers=1):
+    """Threads per decoder, scaled to CPUs/workers (matching LWM pattern)."""
+    cpus = os.cpu_count() or 16
+    return max(1, cpus // max(num_workers, 1))
+
+
+def _decode_video_bytes(raw_bytes, num_frames, width, height, fps, num_workers=1):
+    """Decode video from raw bytes. Priority: torchcodec -> decord -> pyav."""
     try:
-        return _decode_bytes_decord(raw_bytes, num_frames, width, height, fps)
+        return _decode_bytes_torchcodec(raw_bytes, num_frames, width, height, fps, num_workers)
+    except (ImportError, Exception):
+        pass
+    try:
+        return _decode_bytes_decord(raw_bytes, num_frames, width, height, fps, num_workers)
     except ImportError:
         pass
     return _decode_bytes_pyav(raw_bytes, num_frames, width, height, fps)
 
 
-def _decode_bytes_decord(raw_bytes, num_frames, width, height, fps):
+def _decode_bytes_torchcodec(raw_bytes, num_frames, width, height, fps, num_workers=1):
+    """Fastest: torchcodec with multithreaded FFmpeg, direct from bytes."""
+    from torchcodec.decoders import VideoDecoder
+
+    raw_tensor = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint8)
+    decoder = VideoDecoder(raw_tensor, num_ffmpeg_threads=_ffmpeg_threads(num_workers))
+    metadata = decoder.metadata
+    total = metadata.num_frames
+    if total is None or total < 2:
+        return None
+
+    video_fps = metadata.average_fps or 30.0
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+
+    frame_batch = decoder.get_frames_at(indices=indices)
+    # frame_batch.data is (N, C, H, W) uint8
+    rgbs = frame_batch.data.permute(0, 2, 3, 1).numpy()  # (N, H, W, C)
+    return [_resize_and_convert(rgb, width, height) for rgb in rgbs]
+
+
+def _decode_bytes_decord(raw_bytes, num_frames, width, height, fps, num_workers=1):
     from decord import VideoReader, cpu
 
-    vr = VideoReader(io.BytesIO(raw_bytes), ctx=cpu(0))
+    vr = VideoReader(io.BytesIO(raw_bytes), ctx=cpu(0),
+                     num_threads=_ffmpeg_threads(num_workers))
     indices = _pick_indices(len(vr), vr.get_avg_fps() or 30.0, num_frames, fps)
     batch = vr.get_batch(indices).asnumpy()
     return [_resize_and_convert(rgb, width, height) for rgb in batch]
@@ -695,7 +727,8 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
 
                 frames = _decode_video_bytes(
                     video_bytes, self.frames_per_video,
-                    self.width, self.height, self.fps)
+                    self.width, self.height, self.fps,
+                    num_workers=num_workers)
                 if not frames:
                     self._fail += 1
                     continue
