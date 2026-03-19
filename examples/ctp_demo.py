@@ -937,7 +937,8 @@ def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
                           width, height, frames_per_video, fps, qp, max_cu_size,
                           codec_mode="mpeg4"):
     """Extract a small set of traces to discover head_specs and value_limit."""
-    num_videos = max(4, num_warmup_frames // max(frames_per_video, 1))
+    # sample more videos than strictly needed to handle decode failures
+    num_videos = max(8, (num_warmup_frames // max(frames_per_video, 1)) * 3)
 
     if codec_mode == "mpeg4":
         # fetch a few videos, extract mpeg4 traces directly
@@ -958,6 +959,7 @@ def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
         ]
         random.shuffle(video_members)
         traces = []
+        n_ok = n_fail = 0
         for tk, mp, off, sz in video_members[:num_videos]:
             try:
                 resp = client.get_object(Bucket=s3_bucket, Key=tk,
@@ -966,18 +968,29 @@ def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
                 vtraces = extract_mpeg4_traces_from_bytes(raw, frames_per_video, fps)
                 if vtraces:
                     traces.extend(vtraces)
+                    n_ok += 1
+                else:
+                    n_fail += 1
             except Exception:
+                n_fail += 1
                 continue
             if len(traces) >= num_warmup_frames:
                 break
+        print(f"    warmup: {n_ok} videos ok, {n_fail} failed, {len(traces)} traces")
     else:
         frames, _ = load_frames_from_lance(
             manifest, num_videos, frames_per_video,
             width, height, fps, s3_bucket, s3_endpoint)
         traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
 
+    # filter out empty traces
+    traces = [tr for tr in traces if tr]
+    if not traces:
+        raise RuntimeError("warmup failed: no valid traces extracted. check S3 access and video formats.")
+
     head_specs = build_head_specs(traces)
-    value_limit = max(256, max(abs(t.value) for tr in traces for t in tr))
+    all_values = [abs(t.value) for tr in traces for t in tr]
+    value_limit = max(256, max(all_values)) if all_values else 256
     return head_specs, value_limit, traces
 
 
