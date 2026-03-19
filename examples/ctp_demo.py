@@ -4,19 +4,26 @@ CTP (Codec Token Perplexity) Demo
 ==================================
 
 Pipeline:
-  1. Load frames from video via Decord (same pipeline as LWM)
-  2. RGB → YUV420 → nano-hevc encode (trace=True) → symbol token sequence
+  1. Load frames from video (local file or Lance-indexed S3 tars)
+  2. RGB -> YUV420 -> nano-hevc encode (trace=True) -> symbol token sequence
   3. Show token stats + empirical entropy
   4. Train autoregressive codec LM: P(z_t | z_{<t})
-  5. Compare BPT: uniform → unigram → CodecLM
+  5. Compare BPT: uniform -> unigram -> CodecLM
 
-Run:  python examples/ctp_demo.py
+Local mode (default):
+  python examples/ctp_demo.py
+
+Lance/S3 mode (cluster, same pipeline as LWM):
+  python examples/ctp_demo.py --lance-uri s3://ami-labs-data/tables/s3_video_primary.lance --datasets howto100m
 """
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import math
+import os
 import random
 from collections import Counter
 from pathlib import Path
@@ -33,8 +40,33 @@ from nano_hevc.nal import HEVCConfig
 
 VIDEO = Path(__file__).parent / "birds.mp4"
 
+_VIDEO_EXTS = frozenset({".mp4", ".webm", ".mkv", ".avi", ".mov"})
 
-# -- frame loading (decord, matching LWM data.py) ----------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="CTP demo: video -> codec tokens -> LM")
+    p.add_argument("--video", type=Path, default=VIDEO, help="local video file")
+    p.add_argument("--width", type=int, default=128)
+    p.add_argument("--height", type=int, default=64)
+    p.add_argument("--num-frames", type=int, default=3)
+    p.add_argument("--fps", type=int, default=8)
+    p.add_argument("--qp", type=int, default=27)
+    p.add_argument("--epochs", type=int, default=200)
+
+    # lance/s3 data loading (matches LWM data.py schema)
+    p.add_argument("--lance-uri", type=str, default=None,
+                   help="Lance table URI, e.g. s3://ami-labs-data/tables/s3_video_primary.lance")
+    p.add_argument("--datasets", nargs="+", default=["howto100m"],
+                   help="dataset filters for Lance scan")
+    p.add_argument("--s3-bucket", default="ami-labs-data")
+    p.add_argument("--s3-endpoint", default=None,
+                   help="S3 endpoint URL (auto-detected from env if unset)")
+    p.add_argument("--num-videos", type=int, default=3,
+                   help="number of random videos to sample from Lance")
+    return p.parse_args()
+
+
+# -- frame loading: local file ------------------------------------------------
 
 
 def load_video_frames(
@@ -44,11 +76,7 @@ def load_video_frames(
     height: int,
     fps: int = 8,
 ) -> list[Frame]:
-    """Load frames via PyAV and convert RGB -> YUV420 Frame objects.
-
-    Replicates the segment-selection and frame-stepping logic from
-    lwm/data.py:load_video_frames so the two pipelines see identical
-    frame sequences given the same random state.
+    """Load frames from a local video file.
 
     Backend priority: decord (LWM default) -> av (PyAV, portable fallback).
     """
@@ -66,7 +94,7 @@ def _load_frames_decord(video_path, num_frames, width, height, fps):
     total = len(vr)
     video_fps = vr.get_avg_fps() or 30.0
     indices = _pick_indices(total, video_fps, num_frames, fps)
-    batch = vr.get_batch(indices).asnumpy()  # (N, H, W, 3) uint8
+    batch = vr.get_batch(indices).asnumpy()
     return [_resize_and_convert(rgb, width, height) for rgb in batch]
 
 
@@ -78,7 +106,6 @@ def _load_frames_pyav(video_path, num_frames, width, height, fps):
     total = stream.frames or 0
     video_fps = float(stream.average_rate or 30)
 
-    # decode all frames into list, then index
     all_frames = []
     for frame in container.decode(video=0):
         all_frames.append(frame.to_ndarray(format="rgb24"))
@@ -89,6 +116,163 @@ def _load_frames_pyav(video_path, num_frames, width, height, fps):
     indices = _pick_indices(total, video_fps, num_frames, fps)
     return [_resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
             for i in indices]
+
+
+# -- frame loading: Lance manifest + S3 range reads ---------------------------
+# Mirrors lwm/data/dataloader.py: load_manifest_from_lance + S3TarDataset._iter_cached
+
+
+def load_manifest_from_lance(
+    lance_uri: str,
+    datasets: list[str] | None = None,
+    s3_endpoint: str | None = None,
+) -> dict[str, list[tuple[str, int, int]]]:
+    """Scan Lance table -> {tar_key: [(member_path, offset, size), ...]}.
+
+    Same schema and filter logic as lwm/data/dataloader.py.
+    """
+    import lance
+    from collections import defaultdict
+
+    kw = {}
+    if lance_uri.startswith("s3://"):
+        endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+        if endpoint:
+            opts = {
+                "endpoint": endpoint,
+                "allow_http": "true" if endpoint.startswith("http://") else "false",
+            }
+            ak = os.environ.get("AWS_ACCESS_KEY_ID")
+            sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+            if ak and sk:
+                opts["aws_access_key_id"] = ak
+                opts["aws_secret_access_key"] = sk
+            kw["storage_options"] = opts
+
+    ds = lance.dataset(lance_uri, **kw)
+
+    lance_filter = None
+    if datasets:
+        preds = [f"tar_path LIKE '%/tars/{d}/%'" for d in datasets]
+        lance_filter = " OR ".join(preds)
+
+    scan_kw = {"columns": ["tar_path", "member_path", "offset", "size"], "batch_size": 65536}
+    if lance_filter:
+        scan_kw["filter"] = lance_filter
+
+    manifest: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    for batch in ds.to_batches(**scan_kw):
+        tps = batch["tar_path"].to_pylist()
+        mps = batch["member_path"].to_pylist()
+        offs = batch["offset"].to_pylist()
+        szs = batch["size"].to_pylist()
+        for tp, mp, off, sz in zip(tps, mps, offs, szs, strict=False):
+            manifest[tp].append((mp, off, sz))
+
+    return dict(manifest)
+
+
+def load_frames_from_lance(
+    manifest: dict[str, list[tuple[str, int, int]]],
+    num_videos: int,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: int,
+    s3_bucket: str,
+    s3_endpoint: str | None,
+) -> tuple[list[Frame], list[str]]:
+    """Sample random videos from Lance manifest, decode via S3 range reads.
+
+    Returns (frames, source_paths) — one segment per video, concatenated.
+    """
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+    kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300, retries={"max_attempts": 3})}
+    if endpoint:
+        kw["endpoint_url"] = endpoint
+    client = boto3.client("s3", **kw)
+
+    # collect video members across all tars
+    video_members = []
+    for tar_key, members in manifest.items():
+        for mp, off, sz in members:
+            if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS:
+                video_members.append((tar_key, mp, off, sz))
+
+    if not video_members:
+        raise RuntimeError("no video members found in manifest")
+
+    random.shuffle(video_members)
+    selected = video_members[:num_videos]
+
+    all_frames: list[Frame] = []
+    sources: list[str] = []
+
+    for tar_key, member_path, offset, size in selected:
+        print(f"    fetching {member_path} ({size / 1e6:.1f} MB) from {tar_key}")
+        resp = client.get_object(
+            Bucket=s3_bucket,
+            Key=tar_key,
+            Range=f"bytes={offset}-{offset + size - 1}",
+        )
+        video_bytes = resp["Body"].read()
+
+        frames = _decode_video_bytes(video_bytes, num_frames, width, height, fps)
+        if frames:
+            all_frames.extend(frames)
+            sources.append(member_path)
+        else:
+            print(f"    decode failed for {member_path}, skipping")
+
+    return all_frames, sources
+
+
+def _decode_video_bytes(raw_bytes, num_frames, width, height, fps):
+    """Decode video from raw bytes. Same fallback chain as local loading."""
+    try:
+        return _decode_bytes_decord(raw_bytes, num_frames, width, height, fps)
+    except ImportError:
+        pass
+    return _decode_bytes_pyav(raw_bytes, num_frames, width, height, fps)
+
+
+def _decode_bytes_decord(raw_bytes, num_frames, width, height, fps):
+    from decord import VideoReader, cpu
+
+    vr = VideoReader(io.BytesIO(raw_bytes), ctx=cpu(0))
+    total = len(vr)
+    video_fps = vr.get_avg_fps() or 30.0
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+    batch = vr.get_batch(indices).asnumpy()
+    return [_resize_and_convert(rgb, width, height) for rgb in batch]
+
+
+def _decode_bytes_pyav(raw_bytes, num_frames, width, height, fps):
+    import av
+
+    container = av.open(io.BytesIO(raw_bytes))
+    stream = container.streams.video[0]
+    total = stream.frames or 0
+    video_fps = float(stream.average_rate or 30)
+
+    all_frames = []
+    for frame in container.decode(video=0):
+        all_frames.append(frame.to_ndarray(format="rgb24"))
+    container.close()
+
+    if not all_frames:
+        return None
+    if not total:
+        total = len(all_frames)
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+    return [_resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
+            for i in indices]
+
+
+# -- shared frame utilities ---------------------------------------------------
 
 
 def _pick_indices(total, video_fps, num_frames, target_fps):
@@ -208,10 +392,6 @@ def compute_unigram_bpt(trace: list[SymbolTrace]) -> float:
 
 
 # -- Autoregressive Codec LM -------------------------------------------------
-#
-# analysis.md section 8:
-#   P(z_1,...,z_T) = prod_t P(z_t | z_{<t})
-#   BPT = -(1/T) sum_t log2 P(z_t | z_{<t})
 
 _TOKEN_TYPES = [
     "split_cu_flag", "part_mode", "intra_luma_pred_mode",
@@ -329,18 +509,46 @@ def train_codec_lm(trace, fw, fh, epochs=200, lr=3e-3):
 
 
 def main():
-    W, H, QP = 128, 64, 27
-    NUM_FRAMES = 3
+    args = parse_args()
+    W, H = args.width, args.height
 
     print("=" * 70)
     print("  CTP Demo: Video -> Codec Tokens -> Autoregressive LM")
     print("=" * 70)
 
-    print(f"\n[1] Loading {NUM_FRAMES} frames from {VIDEO} via Decord -> {W}x{H}")
-    frames = load_video_frames(VIDEO, NUM_FRAMES, W, H)
+    if args.lance_uri:
+        # Lance/S3 mode: load manifest, sample random videos, fetch via range reads
+        print(f"\n[1] Loading Lance manifest from {args.lance_uri}")
+        print(f"    datasets={args.datasets}")
+        manifest = load_manifest_from_lance(
+            args.lance_uri,
+            datasets=args.datasets,
+            s3_endpoint=args.s3_endpoint,
+        )
+        n_tars = len(manifest)
+        n_members = sum(len(v) for v in manifest.values())
+        print(f"    {n_tars} tars, {n_members:,} members")
 
-    print(f"\n[2] Encoding with nano-hevc (QP={QP}, CU=8x8, trace=True)")
-    traces = encode_and_trace(frames, QP)
+        print(f"\n    Sampling {args.num_videos} videos, {args.num_frames} frames each -> {W}x{H}")
+        frames, sources = load_frames_from_lance(
+            manifest,
+            num_videos=args.num_videos,
+            num_frames=args.num_frames,
+            width=W,
+            height=H,
+            fps=args.fps,
+            s3_bucket=args.s3_bucket,
+            s3_endpoint=args.s3_endpoint,
+        )
+        source_label = f"lance:{','.join(args.datasets)} ({len(sources)} videos)"
+    else:
+        # local file mode
+        print(f"\n[1] Loading {args.num_frames} frames from {args.video} -> {W}x{H}")
+        frames = load_video_frames(args.video, args.num_frames, W, H, args.fps)
+        source_label = args.video.name
+
+    print(f"\n[2] Encoding with nano-hevc (QP={args.qp}, CU=8x8, trace=True)")
+    traces = encode_and_trace(frames, args.qp)
     for i, tr in enumerate(traces):
         print(f"    frame {i}: {len(tr)} tokens")
 
@@ -355,14 +563,14 @@ def main():
     ugr = compute_unigram_bpt(tr0)
 
     print(f"\n    Training CodecLM (d=64, 2L, 2H) on {len(tr0)} tokens ...")
-    _, ar, n_p = train_codec_lm(tr0, W, H)
+    _, ar, n_p = train_codec_lm(tr0, W, H, epochs=args.epochs)
     print(f"\n    {'model':<18} {'BPT':>7}  {'vs uniform':>10}")
     print(f"    {'─' * 38}")
     print(f"    {'uniform':<18} {uni:>7.3f}  {'baseline':>10}")
     print(f"    {'unigram':<18} {ugr:>7.3f}  {(1 - ugr / uni) * 100:>9.1f}%")
     print(f"    {'CodecLM (AR)':<18} {ar:>7.3f}  {(1 - ar / uni) * 100:>9.1f}%")
     print(f"    {'─' * 38}")
-    print(f"    {n_p:,} params | source: {VIDEO.name}")
+    print(f"    {n_p:,} params | source: {source_label}")
 
     out = "/tmp/ctp_symbol_trace.json"
     with open(out, "w") as f:
