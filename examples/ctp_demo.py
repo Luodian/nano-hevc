@@ -395,18 +395,45 @@ def _rgb_to_yuv420(rgb, w, h):
 # -- mpeg-4 token extraction (direct from bitstream, no re-encode) ------------
 
 
+_MV_BINS = 256
+_MV_BIN_EDGES = None  # lazily built
+
+
+def _mv_to_bin(val):
+    """Nonlinear MV quantization: fine bins near zero, coarse in tails.
+
+    Layout (256 bins):
+      bins 0-127:   values [-64, +63] at unit resolution (quarter-pel)
+      bins 128-191: values [-192, -65] and [64, 191] at 2x step
+      bins 192-255: values [-704, -193] and [192, 703] at 8x step
+    """
+    if -64 <= val <= 63:
+        return val + 64  # bins 0-127
+    if -192 <= val < -64:
+        return 128 + (val + 192) // 2  # bins 128-191 (lower half)
+    if 64 <= val <= 191:
+        return 128 + (val - 64) // 2  # bins 128-191 (upper half, overlaps intentionally)
+    if val < -192:
+        b = 192 + (val + 704) // 8
+    else:
+        b = 192 + (val - 192) // 8 + 32
+    return max(0, min(_MV_BINS - 1, b))
+
+
 def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
     """Extract codec tokens directly from MPEG-4/VP8 video bytes via PyAV.
 
-    Uses FFmpeg's motion vector export to get per-macroblock codec decisions
-    without re-encoding. ~50ms/video vs ~16s for HEVC re-encode.
+    Uses FFmpeg's motion vector export to get per-macroblock codec decisions.
+    ~50ms/video vs ~16s for HEVC re-encode.
 
-    Token types emitted per frame:
-      frame_type    - I/P/B (vocab=3)
-      mb_mode       - intra=0, inter=1, skip=2 (vocab=3)
-      mv_x, mv_y   - motion vector delta in quarter-pel (continuous, vocab=0)
-      block_size    - 8 or 16 (vocab=2)
-      mb_has_coeffs - whether this MB has non-zero residual (vocab=2, estimated)
+    Token vocabulary:
+      frame_type     - I/P/B (vocab=3), 1 per frame
+      mb_mode        - intra=0, inter=1, skip=2 (vocab=3), 1 per MB
+      partition_mode - 16x16=0, 16x8=1, 8x16=2, 8x8=3 (vocab=4), inter MBs only
+      mv_x, mv_y    - nonlinear 256-bin discretized (vocab=256), per sub-partition
+
+    Per-MB token order: mb_mode -> [partition_mode -> mv_x -> mv_y ...]
+    Skip/intra MBs: mb_mode only (variable-length, no padding).
 
     Returns list[list[SymbolTrace]], one trace per frame.
     """
@@ -419,7 +446,6 @@ def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
     total = stream.frames or 0
     video_fps = float(stream.average_rate or 30)
 
-    # decode all frames with MV export
     decoded = []
     ptype_names = {1: "I", 2: "P", 3: "B"}
     for frame in container.decode(video=0):
@@ -450,54 +476,70 @@ def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
         mb_w = (w + 15) // 16
         mb_h = (h + 15) // 16
 
-        # build per-MB motion vector map
-        mb_mvs = {}
+        # collect ALL MVs per MB (not just the first)
+        from collections import defaultdict
+        mb_mvs = defaultdict(list)
         if mvs is not None:
             for mv in mvs:
                 mbx = mv.dst_x // 16
                 mby = mv.dst_y // 16
-                key = (mbx, mby)
-                if key not in mb_mvs:
-                    mb_mvs[key] = mv
+                mb_mvs[(mbx, mby)].append(mv)
 
         trace = []
-        # frame-level token
         trace.append(SymbolTrace(
             poc=poc_out, cu_x=0, cu_y=0, cu_size=16,
             plane="Y", token_type="frame_type", value=frame_type_val, vocab_size=3))
 
-        # per-macroblock tokens
         for mby in range(mb_h):
             for mbx in range(mb_w):
                 x, y = mbx * 16, mby * 16
-                mv = mb_mvs.get((mbx, mby))
+                mv_list = mb_mvs.get((mbx, mby), [])
 
                 if frame_type_val == 0:
-                    mode = 0  # intra
-                elif mv is not None:
-                    mode = 1  # inter with MV
+                    mode = 0  # intra (I-frame)
+                elif mv_list:
+                    mode = 1  # inter
                 else:
-                    mode = 2  # skip/no-MV
+                    mode = 2  # skip
 
                 trace.append(SymbolTrace(
                     poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
                     plane="Y", token_type="mb_mode", value=mode, vocab_size=3))
 
-                if mv is not None:
-                    mvx = mv.motion_x  # quarter-pel
-                    mvy = mv.motion_y
-                    bw = mv.w
+                if mode != 1 or not mv_list:
+                    continue
 
+                # infer partition mode from MV block sizes
+                widths = {mv.w for mv in mv_list}
+                heights = {mv.h for mv in mv_list}
+                n_mvs = len(mv_list)
+                if n_mvs >= 4 or (8 in widths and 8 in heights):
+                    part = 3  # 8x8
+                elif 8 in heights and 16 in widths:
+                    part = 1  # 16x8
+                elif 8 in widths and 16 in heights:
+                    part = 2  # 8x16
+                else:
+                    part = 0  # 16x16
+
+                trace.append(SymbolTrace(
+                    poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
+                    plane="Y", token_type="partition_mode", value=part, vocab_size=4))
+
+                # emit MV pairs for each sub-partition
+                # sort by position (top-left first) for consistent ordering
+                sorted_mvs = sorted(mv_list, key=lambda m: (m.dst_y, m.dst_x))
+                # cap at expected count for this partition mode
+                max_mvs = [1, 2, 2, 4][part]
+                for mv in sorted_mvs[:max_mvs]:
                     trace.append(SymbolTrace(
                         poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                        plane="Y", token_type="mv_x", value=mvx, vocab_size=0))
+                        plane="Y", token_type="mv_x",
+                        value=_mv_to_bin(mv.motion_x), vocab_size=_MV_BINS))
                     trace.append(SymbolTrace(
                         poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                        plane="Y", token_type="mv_y", value=mvy, vocab_size=0))
-                    trace.append(SymbolTrace(
-                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                        plane="Y", token_type="block_size",
-                        value=0 if bw <= 8 else 1, vocab_size=2))
+                        plane="Y", token_type="mv_y",
+                        value=_mv_to_bin(mv.motion_y), vocab_size=_MV_BINS))
 
         all_traces.append(trace)
     return all_traces
