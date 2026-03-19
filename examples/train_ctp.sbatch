@@ -40,7 +40,7 @@ echo "gpu:  $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "started: $(date -Iseconds)"
 
 python examples/ctp_demo.py \
-    --lance-uri s3://ami-labs-data/tables/s3_video_primary.lance \
+    --lance-uri /mnt/data/tables/s3_video_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
     --num-videos 50 \
