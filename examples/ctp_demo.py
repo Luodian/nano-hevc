@@ -51,13 +51,18 @@ def parse_args() -> argparse.Namespace:
 
     # data source
     p.add_argument("--video", type=Path, default=VIDEO, help="local video file")
-    p.add_argument("--lance-uri", type=str, default=None,
-                   help="Lance table URI for S3 tar-backed loading")
+    p.add_argument(
+        "--lance-uri",
+        type=str,
+        default=None,
+        help="Lance table URI for S3 tar-backed loading",
+    )
     p.add_argument("--datasets", nargs="+", default=["howto100m"])
     p.add_argument("--s3-bucket", default="ami-labs-data")
     p.add_argument("--s3-endpoint", default=None)
-    p.add_argument("--num-videos", type=int, default=3,
-                   help="videos to sample from Lance")
+    p.add_argument(
+        "--num-videos", type=int, default=3, help="videos to sample from Lance"
+    )
 
     # encoder
     p.add_argument("--width", type=int, default=128)
@@ -76,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-iters", type=int, default=10)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="linear LR warmup steps (0=disabled)")
+    p.add_argument("--max-grad-norm", type=float, default=0.0,
+                   help="gradient clipping norm (0=disabled)")
+    p.add_argument("--amp", action="store_true",
+                   help="use bf16 automatic mixed precision")
 
     # model
     p.add_argument("--n-layer", type=int, default=4)
@@ -89,8 +100,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="log to W&B")
     p.add_argument("--wandb-project", default="nano-hevc-ctp")
     p.add_argument("--wandb-run-name", default=None)
-    p.add_argument("--trace-out", type=Path, default=None,
-                   help="optional JSON dump for the first trace")
+    p.add_argument(
+        "--trace-out",
+        type=Path,
+        default=None,
+        help="optional JSON dump for the first trace",
+    )
     return p.parse_args()
 
 
@@ -123,6 +138,7 @@ def load_video_frames(video_path, num_frames, width, height, fps=8):
 
 def _load_frames_decord(video_path, num_frames, width, height, fps):
     from decord import VideoReader, cpu
+
     vr = VideoReader(str(video_path), ctx=cpu(0))
     indices = _pick_indices(len(vr), vr.get_avg_fps() or 30.0, num_frames, fps)
     batch = vr.get_batch(indices).asnumpy()
@@ -131,6 +147,7 @@ def _load_frames_decord(video_path, num_frames, width, height, fps):
 
 def _load_frames_pyav(video_path, num_frames, width, height, fps):
     import av
+
     container = av.open(str(video_path))
     stream = container.streams.video[0]
     total = stream.frames or 0
@@ -140,8 +157,10 @@ def _load_frames_pyav(video_path, num_frames, width, height, fps):
     if not total:
         total = len(all_frames)
     indices = _pick_indices(total, video_fps, num_frames, fps)
-    return [_resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
-            for i in indices]
+    return [
+        _resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
+        for i in indices
+    ]
 
 
 # -- frame loading: Lance manifest + S3 range reads ---------------------------
@@ -156,8 +175,10 @@ def load_manifest_from_lance(lance_uri, datasets=None, s3_endpoint=None):
     if lance_uri.startswith("s3://"):
         endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
         if endpoint:
-            opts = {"endpoint": endpoint,
-                    "allow_http": "true" if endpoint.startswith("http://") else "false"}
+            opts = {
+                "endpoint": endpoint,
+                "allow_http": "true" if endpoint.startswith("http://") else "false",
+            }
             ak = os.environ.get("AWS_ACCESS_KEY_ID")
             sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
             if ak and sk:
@@ -171,36 +192,49 @@ def load_manifest_from_lance(lance_uri, datasets=None, s3_endpoint=None):
         preds = [f"tar_path LIKE '%/tars/{d}/%'" for d in datasets]
         lance_filter = " OR ".join(preds)
 
-    scan_kw = {"columns": ["tar_path", "member_path", "offset", "size"], "batch_size": 65536}
+    scan_kw = {
+        "columns": ["tar_path", "member_path", "offset", "size"],
+        "batch_size": 65536,
+    }
     if lance_filter:
         scan_kw["filter"] = lance_filter
 
     manifest = defaultdict(list)
     for batch in ds.to_batches(**scan_kw):
-        for tp, mp, off, sz in zip(batch["tar_path"].to_pylist(),
-                                    batch["member_path"].to_pylist(),
-                                    batch["offset"].to_pylist(),
-                                    batch["size"].to_pylist(), strict=False):
+        for tp, mp, off, sz in zip(
+            batch["tar_path"].to_pylist(),
+            batch["member_path"].to_pylist(),
+            batch["offset"].to_pylist(),
+            batch["size"].to_pylist(),
+            strict=False,
+        ):
             manifest[tp].append((mp, off, sz))
     return dict(manifest)
 
 
-def load_frames_from_lance(manifest, num_videos, num_frames, width, height,
-                           fps, s3_bucket, s3_endpoint):
+def load_frames_from_lance(
+    manifest, num_videos, num_frames, width, height, fps, s3_bucket, s3_endpoint
+):
     """Sample random videos from manifest, decode via S3 range reads."""
     import boto3
     from botocore.config import Config as BotoConfig
 
     endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
-    kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
-                                retries={"max_attempts": 3})}
+    kw = {
+        "config": BotoConfig(
+            connect_timeout=30, read_timeout=300, retries={"max_attempts": 3}
+        )
+    }
     if endpoint:
         kw["endpoint_url"] = endpoint
     client = boto3.client("s3", **kw)
 
-    video_members = [(tk, mp, off, sz) for tk, members in manifest.items()
-                     for mp, off, sz in members
-                     if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS]
+    video_members = [
+        (tk, mp, off, sz)
+        for tk, members in manifest.items()
+        for mp, off, sz in members
+        if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS
+    ]
     if not video_members:
         raise RuntimeError("no video members found in manifest")
 
@@ -212,8 +246,11 @@ def load_frames_from_lance(manifest, num_videos, num_frames, width, height,
     for tar_key, member_path, offset, size in selected:
         print(f"    fetching {member_path} ({size / 1e6:.1f} MB)")
         try:
-            resp = client.get_object(Bucket=s3_bucket, Key=tar_key,
-                                     Range=f"bytes={offset}-{offset + size - 1}")
+            resp = client.get_object(
+                Bucket=s3_bucket,
+                Key=tar_key,
+                Range=f"bytes={offset}-{offset + size - 1}",
+            )
             video_bytes = resp["Body"].read()
             frames = _decode_video_bytes(video_bytes, num_frames, width, height, fps)
             if frames:
@@ -236,6 +273,7 @@ def _decode_video_bytes(raw_bytes, num_frames, width, height, fps):
 
 def _decode_bytes_decord(raw_bytes, num_frames, width, height, fps):
     from decord import VideoReader, cpu
+
     vr = VideoReader(io.BytesIO(raw_bytes), ctx=cpu(0))
     indices = _pick_indices(len(vr), vr.get_avg_fps() or 30.0, num_frames, fps)
     batch = vr.get_batch(indices).asnumpy()
@@ -244,6 +282,7 @@ def _decode_bytes_decord(raw_bytes, num_frames, width, height, fps):
 
 def _decode_bytes_pyav(raw_bytes, num_frames, width, height, fps):
     import av
+
     container = av.open(io.BytesIO(raw_bytes))
     stream = container.streams.video[0]
     total = stream.frames or 0
@@ -255,8 +294,10 @@ def _decode_bytes_pyav(raw_bytes, num_frames, width, height, fps):
     if not total:
         total = len(all_frames)
     indices = _pick_indices(total, video_fps, num_frames, fps)
-    return [_resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
-            for i in indices]
+    return [
+        _resize_and_convert(all_frames[min(i, len(all_frames) - 1)], width, height)
+        for i in indices
+    ]
 
 
 # -- shared frame utilities ---------------------------------------------------
@@ -269,8 +310,10 @@ def _pick_indices(total, video_fps, num_frames, target_fps):
         start = random.randint(0, total_available - num_frames)
     else:
         start = 0
-    indices = [min(start * step + i * step, total - 1)
-               for i in range(min(num_frames, max(total_available, 1)))]
+    indices = [
+        min(start * step + i * step, total - 1)
+        for i in range(min(num_frames, max(total_available, 1)))
+    ]
     while len(indices) < num_frames:
         indices.append(indices[-1])
     return indices
@@ -285,11 +328,17 @@ def _resize_and_convert(rgb, width, height):
 
 
 def _rgb_to_yuv420(rgb, w, h):
-    r, g, b = rgb[:,:,0].astype(np.float32), rgb[:,:,1].astype(np.float32), rgb[:,:,2].astype(np.float32)
+    r, g, b = (
+        rgb[:, :, 0].astype(np.float32),
+        rgb[:, :, 1].astype(np.float32),
+        rgb[:, :, 2].astype(np.float32),
+    )
     y = 0.299 * r + 0.587 * g + 0.114 * b
     cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0
     cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0
-    np.clip(y, 0, 255, out=y); np.clip(cb, 0, 255, out=cb); np.clip(cr, 0, 255, out=cr)
+    np.clip(y, 0, 255, out=y)
+    np.clip(cb, 0, 255, out=cb)
+    np.clip(cr, 0, 255, out=cr)
     u = (cb[0::2, 0::2] + cb[0::2, 1::2] + cb[1::2, 0::2] + cb[1::2, 1::2]) * 0.25
     v = (cr[0::2, 0::2] + cr[0::2, 1::2] + cr[1::2, 0::2] + cr[1::2, 1::2]) * 0.25
     frame = Frame.zeros(h, w, dtype=np.int16)
@@ -303,8 +352,9 @@ def _rgb_to_yuv420(rgb, w, h):
 
 
 def encode_symbol_traces(frames, qp, max_cu_size, frames_per_video=None):
-    config = HEVCConfig(width=frames[0].width, height=frames[0].height,
-                        qp=qp, max_cu_size=max_cu_size)
+    config = HEVCConfig(
+        width=frames[0].width, height=frames[0].height, qp=qp, max_cu_size=max_cu_size
+    )
     traces = []
     ref_frames = []
     for poc, frame in enumerate(frames):
@@ -314,8 +364,13 @@ def encode_symbol_traces(frames, qp, max_cu_size, frames_per_video=None):
         frame_type = "I" if not ref_frames else "P"
         refs = ref_frames[-1:] if frame_type != "I" else None
         _, recon, stats = encode_frame(
-            frame, config, fast_mode=True, trace=True, poc=poc,
-            reference_frames=refs, frame_type=frame_type,
+            frame,
+            config,
+            fast_mode=True,
+            trace=True,
+            poc=poc,
+            reference_frames=refs,
+            frame_type=frame_type,
         )
         traces.append(stats["symbol_trace"])
         ref_frames.append(recon)
@@ -417,20 +472,42 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
     tensor_traces = []
     for trace in traces:
         n = len(trace)
-        type_ids = torch.tensor([type_to_id[t.token_type] for t in trace], dtype=torch.long)
+        type_ids = torch.tensor(
+            [type_to_id[t.token_type] for t in trace], dtype=torch.long
+        )
         targets = torch.tensor([t.value for t in trace], dtype=torch.long)
         vocab_sizes = torch.tensor([t.vocab_size for t in trace], dtype=torch.long)
         prev_value_ids = torch.full((n,), bos_value_id, dtype=torch.long)
         if n > 1:
-            prev_value_ids[1:] = torch.tensor([value_to_id(t.value) for t in trace[:-1]], dtype=torch.long)
+            prev_value_ids[1:] = torch.tensor(
+                [value_to_id(t.value) for t in trace[:-1]], dtype=torch.long
+            )
         aux = torch.tensor(
-            [[t.poc / max_poc, t.cu_x / max(width, 1), t.cu_y / max(height, 1),
-              t.cu_size / max_cu_size, PLANE_TO_ID.get(t.plane, 0) / 2.0]
-             for t in trace], dtype=torch.float32)
-        learn_mask = torch.tensor([head_specs[t.token_type].learn for t in trace], dtype=torch.bool)
-        tensor_traces.append(TensorTrace(type_ids=type_ids, prev_value_ids=prev_value_ids,
-                                          targets=targets, vocab_sizes=vocab_sizes,
-                                          aux=aux, learn_mask=learn_mask))
+            [
+                [
+                    t.poc / max_poc,
+                    t.cu_x / max(width, 1),
+                    t.cu_y / max(height, 1),
+                    t.cu_size / max_cu_size,
+                    PLANE_TO_ID.get(t.plane, 0) / 2.0,
+                ]
+                for t in trace
+            ],
+            dtype=torch.float32,
+        )
+        learn_mask = torch.tensor(
+            [head_specs[t.token_type].learn for t in trace], dtype=torch.bool
+        )
+        tensor_traces.append(
+            TensorTrace(
+                type_ids=type_ids,
+                prev_value_ids=prev_value_ids,
+                targets=targets,
+                vocab_sizes=vocab_sizes,
+                aux=aux,
+                learn_mask=learn_mask,
+            )
+        )
 
     rng = random.Random(seed)
     rng.shuffle(tensor_traces)
@@ -443,10 +520,19 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
         train, val = tensor_traces[:split], tensor_traces[split:]
 
     total_tokens = sum(t.length() for t in tensor_traces)
-    return DatasetBundle(train=train, val=val, type_to_id=type_to_id, id_to_type=id_to_type,
-                         head_specs=head_specs, pad_type_id=pad_type_id, bos_value_id=bos_value_id,
-                         value_vocab_size=value_vocab_size, value_limit=value_limit,
-                         source=source, total_tokens=total_tokens)
+    return DatasetBundle(
+        train=train,
+        val=val,
+        type_to_id=type_to_id,
+        id_to_type=id_to_type,
+        head_specs=head_specs,
+        pad_type_id=pad_type_id,
+        bos_value_id=bos_value_id,
+        value_vocab_size=value_vocab_size,
+        value_limit=value_limit,
+        source=source,
+        total_tokens=total_tokens,
+    )
 
 
 # -- batching -----------------------------------------------------------------
@@ -455,7 +541,9 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
 def make_batch(traces, batch_size, block_size, pad_type_id, bos_value_id, device):
     aux_dim = traces[0].aux.shape[-1]
     type_ids = torch.full((batch_size, block_size), pad_type_id, dtype=torch.long)
-    prev_value_ids = torch.full((batch_size, block_size), bos_value_id, dtype=torch.long)
+    prev_value_ids = torch.full(
+        (batch_size, block_size), bos_value_id, dtype=torch.long
+    )
     targets = torch.zeros((batch_size, block_size), dtype=torch.long)
     vocab_sizes = torch.zeros((batch_size, block_size), dtype=torch.long)
     aux = torch.zeros((batch_size, block_size, aux_dim), dtype=torch.float32)
@@ -465,7 +553,9 @@ def make_batch(traces, batch_size, block_size, pad_type_id, bos_value_id, device
     for row in range(batch_size):
         trace = traces[random.randrange(len(traces))]
         length = trace.length()
-        start = 0 if length <= block_size else random.randrange(0, length - block_size + 1)
+        start = (
+            0 if length <= block_size else random.randrange(0, length - block_size + 1)
+        )
         stop = min(length, start + block_size)
         span = stop - start
         type_ids[row, :span] = trace.type_ids[start:stop]
@@ -476,11 +566,18 @@ def make_batch(traces, batch_size, block_size, pad_type_id, bos_value_id, device
         valid_mask[row, :span] = True
         learn_mask[row, :span] = trace.learn_mask[start:stop]
 
-    return {k: v.to(device) for k, v in {
-        "type_ids": type_ids, "prev_value_ids": prev_value_ids,
-        "targets": targets, "vocab_sizes": vocab_sizes,
-        "aux": aux, "valid_mask": valid_mask, "learn_mask": learn_mask,
-    }.items()}
+    return {
+        k: v.to(device)
+        for k, v in {
+            "type_ids": type_ids,
+            "prev_value_ids": prev_value_ids,
+            "targets": targets,
+            "vocab_sizes": vocab_sizes,
+            "aux": aux,
+            "valid_mask": valid_mask,
+            "learn_mask": learn_mask,
+        }.items()
+    }
 
 
 # -- model --------------------------------------------------------------------
@@ -490,8 +587,9 @@ def discrete_logistic_nll(params, targets):
     mu, log_scale = params.unbind(dim=-1)
     scale = log_scale.exp().clamp(min=0.01, max=50.0)
     x = targets.float()
-    prob = (torch.sigmoid((x + 0.5 - mu) / scale)
-            - torch.sigmoid((x - 0.5 - mu) / scale)).clamp(min=1e-9)
+    prob = (
+        torch.sigmoid((x + 0.5 - mu) / scale) - torch.sigmoid((x - 0.5 - mu) / scale)
+    ).clamp(min=1e-9)
     return -prob.log()
 
 
@@ -509,27 +607,38 @@ class CTPModel(nn.Module):
         self.drop = nn.Dropout(config.dropout)
 
         layer = nn.TransformerEncoderLayer(
-            d_model=config.n_embd, nhead=config.n_head,
-            dim_feedforward=config.n_embd * 4, dropout=config.dropout,
-            activation="gelu", batch_first=True, norm_first=False)
+            d_model=config.n_embd,
+            nhead=config.n_head,
+            dim_feedforward=config.n_embd * 4,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
         self.backbone = nn.TransformerEncoder(layer, num_layers=config.n_layer)
         self.ln_f = nn.LayerNorm(config.n_embd)
-        self.heads = nn.ModuleDict({
-            name: nn.Linear(config.n_embd, spec.out_dim)
-            for name, spec in head_specs.items()
-        })
+        self.heads = nn.ModuleDict(
+            {
+                name: nn.Linear(config.n_embd, spec.out_dim)
+                for name, spec in head_specs.items()
+            }
+        )
 
     def forward(self, batch):
         type_ids = batch["type_ids"]
         B, T = type_ids.shape
         positions = torch.arange(T, device=type_ids.device)
-        x = (self.type_emb(type_ids)
-             + self.prev_value_emb(batch["prev_value_ids"])
-             + self.pos_emb(positions)[None]
-             + self.aux_proj(batch["aux"]))
+        x = (
+            self.type_emb(type_ids)
+            + self.prev_value_emb(batch["prev_value_ids"])
+            + self.pos_emb(positions)[None]
+            + self.aux_proj(batch["aux"])
+        )
         x = self.drop(x)
 
-        causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+        )
         hidden = self.ln_f(self.backbone(x, mask=causal_mask))
 
         hidden_flat = hidden.reshape(B * T, -1)
@@ -550,7 +659,8 @@ class CTPModel(nn.Module):
 
             if spec.family == "binary":
                 loss_total = loss_total + F.binary_cross_entropy_with_logits(
-                    head(h).squeeze(-1), y.float(), reduction="sum")
+                    head(h).squeeze(-1), y.float(), reduction="sum"
+                )
             elif spec.family == "continuous":
                 loss_total = loss_total + discrete_logistic_nll(head(h), y).sum()
             else:
@@ -559,7 +669,8 @@ class CTPModel(nn.Module):
                     vm = local_vocab == vs
                     v = int(vs.item())
                     loss_total = loss_total + F.cross_entropy(
-                        head(h[vm])[:, :v], y[vm].clamp(0, v - 1), reduction="sum")
+                        head(h[vm])[:, :v], y[vm].clamp(0, v - 1), reduction="sum"
+                    )
             token_total += int(mask.sum().item())
 
         if token_total == 0:
@@ -580,8 +691,14 @@ def estimate_loss(model, dataset, batch_size, block_size, eval_iters, device):
     for name, traces in [("train", dataset.train), ("val", dataset.val)]:
         bpts = []
         for _ in range(eval_iters):
-            batch = make_batch(traces, batch_size, block_size,
-                               dataset.pad_type_id, dataset.bos_value_id, device)
+            batch = make_batch(
+                traces,
+                batch_size,
+                block_size,
+                dataset.pad_type_id,
+                dataset.bos_value_id,
+                device,
+            )
             _, bpt = model(batch)
             bpts.append(bpt)
         out[name] = sum(bpts) / len(bpts)
@@ -594,7 +711,9 @@ def compute_uniform_bpt(traces):
     for trace in traces:
         vocab_sizes = trace.vocab_sizes[trace.learn_mask]
         for vs in vocab_sizes.tolist():
-            total_bits += 1.0 if vs == 2 else math.log2(vs) if vs > 2 else OPEN_VOCAB_UNIFORM_BITS
+            total_bits += (
+                1.0 if vs == 2 else math.log2(vs) if vs > 2 else OPEN_VOCAB_UNIFORM_BITS
+            )
         total_tokens += int(vocab_sizes.numel())
     return total_bits / max(total_tokens, 1)
 
@@ -603,15 +722,19 @@ def compute_unigram_bpt(train, val, id_to_type):
     counts = {tt: Counter() for tt in id_to_type}
     totals = {tt: 0 for tt in id_to_type}
     for trace in train:
-        for tid, target in zip(trace.type_ids[trace.learn_mask].tolist(),
-                               trace.targets[trace.learn_mask].tolist()):
+        for tid, target in zip(
+            trace.type_ids[trace.learn_mask].tolist(),
+            trace.targets[trace.learn_mask].tolist(),
+        ):
             counts[id_to_type[tid]][target] += 1
             totals[id_to_type[tid]] += 1
 
     total_bits = total_tokens = 0
     for trace in val:
-        for tid, target in zip(trace.type_ids[trace.learn_mask].tolist(),
-                               trace.targets[trace.learn_mask].tolist()):
+        for tid, target in zip(
+            trace.type_ids[trace.learn_mask].tolist(),
+            trace.targets[trace.learn_mask].tolist(),
+        ):
             tt = id_to_type[tid]
             c = counts[tt]
             support = max(len(c), 1)
@@ -633,7 +756,11 @@ def main():
     wandb_run = None
     if args.wandb:
         import wandb
-        run_name = args.wandb_run_name or f"ctp-{args.num_videos}v-{args.n_layer}L-{args.n_embd}d"
+
+        run_name = (
+            args.wandb_run_name
+            or f"ctp-{args.num_videos}v-{args.n_layer}L-{args.n_embd}d"
+        )
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=run_name,
@@ -644,21 +771,32 @@ def main():
     if args.lance_uri:
         print(f"[1] loading Lance manifest from {args.lance_uri}")
         print(f"    datasets={args.datasets}")
-        manifest = load_manifest_from_lance(args.lance_uri, args.datasets, args.s3_endpoint)
+        manifest = load_manifest_from_lance(
+            args.lance_uri, args.datasets, args.s3_endpoint
+        )
         n_tars = len(manifest)
         n_members = sum(len(v) for v in manifest.values())
         print(f"    {n_tars} tars, {n_members:,} members")
 
-        print(f"    sampling {args.num_videos} videos, {args.frames_per_video} frames each -> {args.width}x{args.height}")
+        print(
+            f"    sampling {args.num_videos} videos, {args.frames_per_video} frames each -> {args.width}x{args.height}"
+        )
         frames, sources = load_frames_from_lance(
-            manifest, args.num_videos, args.frames_per_video,
-            args.width, args.height, args.fps,
-            args.s3_bucket, args.s3_endpoint)
+            manifest,
+            args.num_videos,
+            args.frames_per_video,
+            args.width,
+            args.height,
+            args.fps,
+            args.s3_bucket,
+            args.s3_endpoint,
+        )
         source_label = f"lance:{','.join(args.datasets)} ({len(sources)} videos)"
     else:
         print(f"[1] loading {args.frames_per_video} frames from {args.video}")
-        frames = load_video_frames(args.video, args.frames_per_video,
-                                   args.width, args.height, args.fps)
+        frames = load_video_frames(
+            args.video, args.frames_per_video, args.width, args.height, args.fps
+        )
         source_label = args.video.name
 
     print(f"    {len(frames)} frames loaded")
@@ -666,24 +804,45 @@ def main():
     # -- step 2: encode symbol traces --
     print("[2] encoding symbol traces")
     t0 = time.monotonic()
-    traces = encode_symbol_traces(frames, args.qp, args.max_cu_size, args.frames_per_video)
+    traces = encode_symbol_traces(
+        frames, args.qp, args.max_cu_size, args.frames_per_video
+    )
     encode_time = time.monotonic() - t0
     total_tokens = sum(len(tr) for tr in traces)
     print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")
 
     # -- step 3: build dataset --
     print("[3] building train/val split")
-    dataset = build_dataset(traces, args.width, args.height,
-                            args.val_fraction, args.seed, source_label)
+    dataset = build_dataset(
+        traces, args.width, args.height, args.val_fraction, args.seed, source_label
+    )
 
     model_config = ModelConfig(
-        block_size=args.block_size, n_layer=args.n_layer, n_head=args.n_head,
-        n_embd=args.n_embd, dropout=args.dropout,
+        block_size=args.block_size,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        dropout=args.dropout,
         type_vocab_size=dataset.pad_type_id + 1,
-        value_vocab_size=dataset.value_vocab_size)
+        value_vocab_size=dataset.value_vocab_size,
+    )
     model = CTPModel(model_config, dataset.head_specs, dataset.type_to_id).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
-                                   weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+    )
+
+    # LR warmup schedule (constant after warmup, matching LWM)
+    def lr_lambda(step):
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return float(step) / float(max(1, args.warmup_steps))
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # AMP for bf16
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     uniform_bpt = compute_uniform_bpt(dataset.val)
     unigram_bpt = compute_unigram_bpt(dataset.train, dataset.val, dataset.id_to_type)
@@ -698,8 +857,13 @@ def main():
     print(f"tokens            : {dataset.total_tokens:,}")
     print(f"train/val traces  : {len(dataset.train)} / {len(dataset.val)}")
     print(f"model params      : {n_params:,}")
-    print(f"value bucket size : {dataset.value_vocab_size} (limit=+/-{dataset.value_limit})")
+    print(
+        f"value bucket size : {dataset.value_vocab_size} (limit=+/-{dataset.value_limit})"
+    )
     print(f"head specs        : {len(dataset.head_specs)} types")
+    print(f"amp               : {'bf16' if use_amp else 'off'}")
+    print(f"warmup            : {args.warmup_steps} steps")
+    print(f"grad clip         : {args.max_grad_norm or 'off'}")
     print(f"\nbaselines")
     print(f"{'uniform':<16} {uniform_bpt:>8.3f} bpt")
     print(f"{'unigram':<16} {unigram_bpt:>8.3f} bpt")
@@ -713,40 +877,72 @@ def main():
         wandb_run.summary["encode_time_s"] = encode_time
 
     # -- step 4: train --
-    print(f"\ntraining ({args.max_iters} iters, bs={args.batch_size}, ctx={args.block_size})")
+    print(
+        f"\ntraining ({args.max_iters} iters, bs={args.batch_size}, ctx={args.block_size})"
+    )
     best_val = float("inf")
     for step in range(args.max_iters + 1):
         if step % args.eval_interval == 0 or step == args.max_iters:
-            metrics = estimate_loss(model, dataset, args.batch_size,
-                                    args.block_size, args.eval_iters, device)
+            metrics = estimate_loss(
+                model,
+                dataset,
+                args.batch_size,
+                args.block_size,
+                args.eval_iters,
+                device,
+            )
             best_val = min(best_val, metrics["val"])
-            print(f"step {step:>5d} | train {metrics['train']:.3f} bpt | val {metrics['val']:.3f} bpt")
+            print(
+                f"step {step:>5d} | train {metrics['train']:.3f} bpt | val {metrics['val']:.3f} bpt"
+            )
             if wandb_run:
-                wandb_run.log({"step": step,
-                               "train/bpt": metrics["train"],
-                               "val/bpt": metrics["val"],
-                               "val/best_bpt": best_val})
+                wandb_run.log(
+                    {
+                        "step": step,
+                        "train/bpt": metrics["train"],
+                        "val/bpt": metrics["val"],
+                        "val/best_bpt": best_val,
+                    }
+                )
 
         if step == args.max_iters:
             break
 
-        batch = make_batch(dataset.train, args.batch_size, args.block_size,
-                           dataset.pad_type_id, dataset.bos_value_id, device)
-        loss, train_bpt = model(batch)
+        batch = make_batch(
+            dataset.train,
+            args.batch_size,
+            args.block_size,
+            dataset.pad_type_id,
+            dataset.bos_value_id,
+            device,
+        )
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            loss, train_bpt = model(batch)
+        scaler.scale(loss).backward()
+        if args.max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
 
         if wandb_run and step % 10 == 0:
-            wandb_run.log({"step": step, "train/loss": loss.item(),
-                           "train/bpt_step": train_bpt})
+            wandb_run.log(
+                {"step": step, "train/loss": loss.item(), "train/bpt_step": train_bpt,
+                 "lr": scheduler.get_last_lr()[0]}
+            )
 
     # -- results --
     print(f"\n{'model':<18} {'BPT':>7}  {'vs uniform':>10}")
     print(f"{'─' * 38}")
     print(f"{'uniform':<18} {uniform_bpt:>7.3f}  {'baseline':>10}")
-    print(f"{'unigram':<18} {unigram_bpt:>7.3f}  {(1 - unigram_bpt / uniform_bpt) * 100:>9.1f}%")
-    print(f"{'CTPModel':<18} {best_val:>7.3f}  {(1 - best_val / uniform_bpt) * 100:>9.1f}%")
+    print(
+        f"{'unigram':<18} {unigram_bpt:>7.3f}  {(1 - unigram_bpt / uniform_bpt) * 100:>9.1f}%"
+    )
+    print(
+        f"{'CTPModel':<18} {best_val:>7.3f}  {(1 - best_val / uniform_bpt) * 100:>9.1f}%"
+    )
     print(f"{'─' * 38}")
     print(f"{n_params:,} params | source: {source_label}")
 
@@ -756,10 +952,19 @@ def main():
 
     if args.trace_out:
         args.trace_out.parent.mkdir(parents=True, exist_ok=True)
-        payload = [{"poc": t.poc, "cu_x": t.cu_x, "cu_y": t.cu_y,
-                     "cu_size": t.cu_size, "plane": t.plane,
-                     "token_type": t.token_type, "value": t.value,
-                     "vocab_size": t.vocab_size} for t in traces[0]]
+        payload = [
+            {
+                "poc": t.poc,
+                "cu_x": t.cu_x,
+                "cu_y": t.cu_y,
+                "cu_size": t.cu_size,
+                "plane": t.plane,
+                "token_type": t.token_type,
+                "value": t.value,
+                "vocab_size": t.vocab_size,
+            }
+            for t in traces[0]
+        ]
         args.trace_out.write_text(json.dumps(payload, indent=2))
         print(f"\ntrace json: {args.trace_out}")
 
