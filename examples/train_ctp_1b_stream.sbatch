@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=96G
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/brian/logs/slurm/ctp-1b-stream-%j.out
 #SBATCH --error=/home/brian/logs/slurm/ctp-1b-stream-%j.err
