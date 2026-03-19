@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     # encoder
+    p.add_argument("--codec-mode", choices=["hevc", "mpeg4"], default="mpeg4",
+                   help="hevc=re-encode with nano-hevc (slow), mpeg4=extract from bitstream (fast)")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--height", type=int, default=64)
     p.add_argument("--frames-per-video", type=int, default=8)
@@ -390,7 +392,125 @@ def _rgb_to_yuv420(rgb, w, h):
     return frame
 
 
-# -- encode -> traces ---------------------------------------------------------
+# -- mpeg-4 token extraction (direct from bitstream, no re-encode) ------------
+
+
+def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
+    """Extract codec tokens directly from MPEG-4/VP8 video bytes via PyAV.
+
+    Uses FFmpeg's motion vector export to get per-macroblock codec decisions
+    without re-encoding. ~50ms/video vs ~16s for HEVC re-encode.
+
+    Token types emitted per frame:
+      frame_type    - I/P/B (vocab=3)
+      mb_mode       - intra=0, inter=1, skip=2 (vocab=3)
+      mv_x, mv_y   - motion vector delta in quarter-pel (continuous, vocab=0)
+      block_size    - 8 or 16 (vocab=2)
+      mb_has_coeffs - whether this MB has non-zero residual (vocab=2, estimated)
+
+    Returns list[list[SymbolTrace]], one trace per frame.
+    """
+    import av
+
+    container = av.open(io.BytesIO(raw_bytes))
+    stream = container.streams.video[0]
+    stream.codec_context.options = {"flags2": "+export_mvs"}
+
+    total = stream.frames or 0
+    video_fps = float(stream.average_rate or 30)
+
+    # decode all frames with MV export
+    decoded = []
+    ptype_names = {1: "I", 2: "P", 3: "B"}
+    for frame in container.decode(video=0):
+        ptype = ptype_names.get(int(frame.pict_type), "I")
+        mvs = None
+        for sd in frame.side_data:
+            if "MOTION" in str(sd.type).upper():
+                mvs = sd
+                break
+        w, h = frame.width, frame.height
+        decoded.append((ptype, mvs, w, h))
+    container.close()
+
+    if not decoded:
+        return None
+    if not total:
+        total = len(decoded)
+
+    indices = _pick_indices(total, video_fps, num_frames, fps)
+    ptype_map = {"I": 0, "P": 1, "B": 2}
+
+    all_traces = []
+    for poc_out, idx in enumerate(indices):
+        if idx >= len(decoded):
+            idx = len(decoded) - 1
+        ptype, mvs, w, h = decoded[idx]
+        frame_type_val = ptype_map.get(ptype, 0)
+        mb_w = (w + 15) // 16
+        mb_h = (h + 15) // 16
+
+        # build per-MB motion vector map
+        mb_mvs = {}
+        if mvs is not None:
+            for mv in mvs:
+                mbx = mv.dst_x // 16
+                mby = mv.dst_y // 16
+                key = (mbx, mby)
+                if key not in mb_mvs:
+                    mb_mvs[key] = mv
+
+        trace = []
+        # frame-level token
+        trace.append(SymbolTrace(
+            poc=poc_out, cu_x=0, cu_y=0, cu_size=16,
+            plane="Y", token_type="frame_type", value=frame_type_val, vocab_size=3))
+
+        # per-macroblock tokens
+        for mby in range(mb_h):
+            for mbx in range(mb_w):
+                x, y = mbx * 16, mby * 16
+                mv = mb_mvs.get((mbx, mby))
+
+                if frame_type_val == 0:
+                    mode = 0  # intra
+                elif mv is not None:
+                    mode = 1  # inter with MV
+                else:
+                    mode = 2  # skip/no-MV
+
+                trace.append(SymbolTrace(
+                    poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
+                    plane="Y", token_type="mb_mode", value=mode, vocab_size=3))
+
+                if mv is not None:
+                    mvx = mv.motion_x  # quarter-pel
+                    mvy = mv.motion_y
+                    bw = mv.w
+
+                    trace.append(SymbolTrace(
+                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
+                        plane="Y", token_type="mv_x", value=mvx, vocab_size=0))
+                    trace.append(SymbolTrace(
+                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
+                        plane="Y", token_type="mv_y", value=mvy, vocab_size=0))
+                    trace.append(SymbolTrace(
+                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
+                        plane="Y", token_type="block_size",
+                        value=0 if bw <= 8 else 1, vocab_size=2))
+
+        all_traces.append(trace)
+    return all_traces
+
+
+def extract_mpeg4_traces_from_video(video_path, num_frames, fps=8):
+    """Extract MPEG-4 traces from a local video file."""
+    with open(str(video_path), "rb") as f:
+        raw_bytes = f.read()
+    return extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps)
+
+
+# -- encode -> traces (HEVC re-encode path) -----------------------------------
 
 
 def encode_symbol_traces(frames, qp, max_cu_size, frames_per_video=None):
@@ -652,13 +772,16 @@ def _make_window(type_ids, prev_value_ids, targets, vocab_sizes, aux, learn_mask
 
 
 class CTPStreamDataset(torch.utils.data.IterableDataset):
-    """Stream: S3 range read -> decode -> HEVC encode -> tensorize -> yield windows."""
+    """Stream: S3 range read -> extract codec tokens -> tensorize -> yield windows.
+
+    codec_mode="mpeg4": parse MPEG-4/VP8 bitstream directly (~50ms/video)
+    codec_mode="hevc":  decode + re-encode with nano-hevc (~16s/video)
+    """
 
     def __init__(self, manifest, s3_bucket, s3_endpoint,
                  width, height, frames_per_video, fps, qp, max_cu_size, block_size,
-                 type_to_id, head_specs, value_limit, seed=42):
+                 type_to_id, head_specs, value_limit, codec_mode="mpeg4", seed=42):
         super().__init__()
-        # flatten manifest into a list of (tar_key, member_path, offset, size)
         self.video_members = [
             (tk, mp, off, sz)
             for tk, members in manifest.items()
@@ -679,6 +802,7 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
         self.value_limit = value_limit
         self.pad_type_id = len(type_to_id)
         self.bos_value_id = value_limit * 2 + 3 - 1
+        self.codec_mode = codec_mode
         self.seed = seed
         self._local = threading.local()
         self._ok = 0
@@ -701,7 +825,6 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
         worker_id = wi.id if wi else 0
         num_workers = wi.num_workers if wi else 1
 
-        # chunked shard of video members per worker
         members = list(self.video_members)
         n = len(members)
         chunk = n // num_workers
@@ -725,32 +848,39 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
                     self._fail += 1
                     continue
 
-                frames = _decode_video_bytes(
-                    video_bytes, self.frames_per_video,
-                    self.width, self.height, self.fps,
-                    num_workers=num_workers)
-                if not frames:
+                try:
+                    if self.codec_mode == "mpeg4":
+                        traces = extract_mpeg4_traces_from_bytes(
+                            video_bytes, self.frames_per_video, self.fps)
+                    else:
+                        frames = _decode_video_bytes(
+                            video_bytes, self.frames_per_video,
+                            self.width, self.height, self.fps,
+                            num_workers=num_workers)
+                        if not frames:
+                            self._fail += 1
+                            continue
+                        traces = []
+                        ref_frames = []
+                        for poc, frame in enumerate(frames):
+                            ft = "I" if not ref_frames else "P"
+                            refs = ref_frames[-1:] if ft != "I" else None
+                            _, recon, stats = encode_frame(
+                                frame, config, fast_mode=True, trace=True,
+                                poc=poc, reference_frames=refs, frame_type=ft)
+                            traces.append(stats["symbol_trace"])
+                            ref_frames.append(recon)
+                except Exception:
                     self._fail += 1
                     continue
 
-                # HEVC encode each frame -> traces -> windows
-                ref_frames = []
-                for poc, frame in enumerate(frames):
-                    frame_type = "I" if not ref_frames else "P"
-                    refs = ref_frames[-1:] if frame_type != "I" else None
-                    try:
-                        _, recon, stats = encode_frame(
-                            frame, config, fast_mode=True, trace=True,
-                            poc=poc, reference_frames=refs, frame_type=frame_type)
-                    except Exception:
-                        self._fail += 1
-                        continue
+                if not traces:
+                    self._fail += 1
+                    continue
 
-                    trace = stats["symbol_trace"]
-                    ref_frames.append(recon)
+                for trace in traces:
                     if not trace:
                         continue
-
                     tensors = tensorize_trace(
                         trace, self.type_to_id, self.head_specs,
                         self.value_limit, self.width, self.height)
@@ -762,13 +892,48 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
 
 
 def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
-                          width, height, frames_per_video, fps, qp, max_cu_size):
-    """Encode a small set of frames to discover head_specs and value_limit."""
-    num_videos = max(1, num_warmup_frames // max(frames_per_video, 1))
-    frames, _ = load_frames_from_lance(
-        manifest, num_videos, frames_per_video,
-        width, height, fps, s3_bucket, s3_endpoint)
-    traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
+                          width, height, frames_per_video, fps, qp, max_cu_size,
+                          codec_mode="mpeg4"):
+    """Extract a small set of traces to discover head_specs and value_limit."""
+    num_videos = max(4, num_warmup_frames // max(frames_per_video, 1))
+
+    if codec_mode == "mpeg4":
+        # fetch a few videos, extract mpeg4 traces directly
+        import boto3
+        from botocore.config import Config as BotoConfig
+        endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+        kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
+                                    retries={"max_attempts": 3})}
+        if endpoint:
+            kw["endpoint_url"] = endpoint
+        client = boto3.client("s3", **kw)
+
+        video_members = [
+            (tk, mp, off, sz)
+            for tk, members in manifest.items()
+            for mp, off, sz in members
+            if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS
+        ]
+        random.shuffle(video_members)
+        traces = []
+        for tk, mp, off, sz in video_members[:num_videos]:
+            try:
+                resp = client.get_object(Bucket=s3_bucket, Key=tk,
+                                         Range=f"bytes={off}-{off + sz - 1}")
+                raw = resp["Body"].read()
+                vtraces = extract_mpeg4_traces_from_bytes(raw, frames_per_video, fps)
+                if vtraces:
+                    traces.extend(vtraces)
+            except Exception:
+                continue
+            if len(traces) >= num_warmup_frames:
+                break
+    else:
+        frames, _ = load_frames_from_lance(
+            manifest, num_videos, frames_per_video,
+            width, height, fps, s3_bucket, s3_endpoint)
+        traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
+
     head_specs = build_head_specs(traces)
     value_limit = max(256, max(abs(t.value) for tr in traces for t in tr))
     return head_specs, value_limit, traces
@@ -776,12 +941,42 @@ def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
 
 def build_eval_pool(manifest, num_eval_videos, type_to_id, head_specs, value_limit,
                     s3_bucket, s3_endpoint, width, height, frames_per_video,
-                    fps, qp, max_cu_size, seed):
-    """Pre-encode a held-out set of videos for evaluation."""
-    frames, _ = load_frames_from_lance(
-        manifest, num_eval_videos, frames_per_video,
-        width, height, fps, s3_bucket, s3_endpoint)
-    traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
+                    fps, qp, max_cu_size, seed, codec_mode="mpeg4"):
+    """Pre-extract traces from a held-out set of videos for evaluation."""
+    if codec_mode == "mpeg4":
+        import boto3
+        from botocore.config import Config as BotoConfig
+        endpoint = s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+        kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
+                                    retries={"max_attempts": 3})}
+        if endpoint:
+            kw["endpoint_url"] = endpoint
+        client = boto3.client("s3", **kw)
+
+        video_members = [
+            (tk, mp, off, sz)
+            for tk, members in manifest.items()
+            for mp, off, sz in members
+            if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS
+        ]
+        rng = random.Random(seed + 99999)
+        rng.shuffle(video_members)
+        traces = []
+        for tk, mp, off, sz in video_members[:num_eval_videos]:
+            try:
+                resp = client.get_object(Bucket=s3_bucket, Key=tk,
+                                         Range=f"bytes={off}-{off + sz - 1}")
+                raw = resp["Body"].read()
+                vtraces = extract_mpeg4_traces_from_bytes(raw, frames_per_video, fps)
+                if vtraces:
+                    traces.extend(vtraces)
+            except Exception:
+                continue
+    else:
+        frames, _ = load_frames_from_lance(
+            manifest, num_eval_videos, frames_per_video,
+            width, height, fps, s3_bucket, s3_endpoint)
+        traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
 
     id_to_type = list(head_specs.keys())
     pad_type_id = len(id_to_type)
@@ -1034,7 +1229,7 @@ def _run_streaming(args, device, wandb_run):
     head_specs, value_limit, warmup_traces = warmup_discover_specs(
         manifest, args.warmup_frames, args.s3_bucket, args.s3_endpoint,
         args.width, args.height, args.frames_per_video, args.fps,
-        args.qp, args.max_cu_size)
+        args.qp, args.max_cu_size, codec_mode=args.codec_mode)
     id_to_type = list(head_specs.keys())
     type_to_id = {name: idx for idx, name in enumerate(id_to_type)}
     pad_type_id = len(id_to_type)
@@ -1049,7 +1244,8 @@ def _run_streaming(args, device, wandb_run):
     eval_bundle = build_eval_pool(
         manifest, args.eval_videos, type_to_id, head_specs, value_limit,
         args.s3_bucket, args.s3_endpoint, args.width, args.height,
-        args.frames_per_video, args.fps, args.qp, args.max_cu_size, args.seed)
+        args.frames_per_video, args.fps, args.qp, args.max_cu_size, args.seed,
+        codec_mode=args.codec_mode)
     print(f"    {eval_bundle.total_tokens:,} eval tokens")
 
     uniform_bpt = compute_uniform_bpt(eval_bundle.val)
@@ -1079,7 +1275,8 @@ def _run_streaming(args, device, wandb_run):
         manifest, args.s3_bucket, args.s3_endpoint,
         args.width, args.height, args.frames_per_video, args.fps,
         args.qp, args.max_cu_size, args.block_size,
-        type_to_id, head_specs, value_limit, seed=args.seed)
+        type_to_id, head_specs, value_limit,
+        codec_mode=args.codec_mode, seed=args.seed)
     loader = torch.utils.data.DataLoader(
         stream_dataset, batch_size=args.batch_size,
         num_workers=args.streaming_workers, pin_memory=True,
@@ -1225,12 +1422,17 @@ def main():
 
     print(f"    {len(frames)} frames loaded")
 
-    # -- step 2: encode symbol traces --
-    print("[2] encoding symbol traces")
+    # -- step 2: extract/encode symbol traces --
+    print(f"[2] extracting traces (codec_mode={args.codec_mode})")
     t0 = time.monotonic()
-    traces = encode_symbol_traces(
-        frames, args.qp, args.max_cu_size, args.frames_per_video
-    )
+    if args.codec_mode == "mpeg4":
+        traces = extract_mpeg4_traces_from_video(
+            args.video, args.frames_per_video, args.fps)
+        if traces is None:
+            traces = []
+    else:
+        traces = encode_symbol_traces(
+            frames, args.qp, args.max_cu_size, args.frames_per_video)
     encode_time = time.monotonic() - t0
     total_tokens = sum(len(tr) for tr in traces)
     print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")

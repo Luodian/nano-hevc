@@ -49,6 +49,7 @@ python examples/ctp_demo.py \
     --datasets howto100m \
     --warmup-frames 64 \
     --eval-videos 50 \
+    --codec-mode mpeg4 \
     --frames-per-video 8 \
     --width 128 \
     --height 64 \
