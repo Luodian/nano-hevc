@@ -1334,11 +1334,12 @@ def _run_streaming(args, device, wandb_run):
         args.qp, args.max_cu_size, args.block_size,
         type_to_id, head_specs, value_limit,
         codec_mode=args.codec_mode, seed=args.seed)
+    nw = args.streaming_workers
     loader = torch.utils.data.DataLoader(
         stream_dataset, batch_size=args.batch_size,
-        num_workers=args.streaming_workers, pin_memory=True,
-        persistent_workers=args.streaming_workers > 0,
-        prefetch_factor=4 if args.streaming_workers > 0 else None)
+        num_workers=nw, pin_memory=True,
+        persistent_workers=nw > 0,
+        prefetch_factor=2 if nw > 0 else None)
 
     print("=" * 72)
     print("ctp streaming trainer")
