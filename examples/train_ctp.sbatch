@@ -22,9 +22,10 @@ cd "${REPO}"
 # install nano-hevc in the container
 pip install -e . --quiet 2>&1 | tail -1
 
-# source AWS credentials for S3 access
+# S3 credentials and endpoint (Nebius Object Storage)
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials"
 export AWS_CONFIG_FILE="$HOME/.aws/config"
+export S3_ENDPOINT_URL="https://storage.eu-north1.nebius.cloud"
 
 # W&B setup
 if [ -z "${WANDB_API_KEY:-}" ] && [ -f /home/brian/.wandb_api_key ]; then
@@ -40,6 +41,7 @@ echo "started: $(date -Iseconds)"
 
 python examples/ctp_demo.py \
     --lance-uri s3://ami-labs-data/tables/s3_video_primary.lance \
+    --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
     --num-videos 50 \
     --frames-per-video 8 \
