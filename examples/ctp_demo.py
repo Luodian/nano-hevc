@@ -848,21 +848,8 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
         self.bos_value_id = value_limit * 2 + 3 - 1
         self.codec_mode = codec_mode
         self.seed = seed
-        self._local = threading.local()
         self._ok = 0
         self._fail = 0
-
-    def _client(self):
-        if not hasattr(self._local, "client"):
-            import boto3
-            from botocore.config import Config as BotoConfig
-            kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
-                                        retries={"max_attempts": 3})}
-            endpoint = self.s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
-            if endpoint:
-                kw["endpoint_url"] = endpoint
-            self._local.client = boto3.client("s3", **kw)
-        return self._local.client
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -880,11 +867,21 @@ class CTPStreamDataset(torch.utils.data.IterableDataset):
         config = HEVCConfig(width=self.width, height=self.height,
                             qp=self.qp, max_cu_size=self.max_cu_size)
 
+        # create S3 client inside worker process (spawn-safe)
+        import boto3
+        from botocore.config import Config as BotoConfig
+        client_kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
+                                           retries={"max_attempts": 3})}
+        endpoint = self.s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+        if endpoint:
+            client_kw["endpoint_url"] = endpoint
+        s3 = boto3.client("s3", **client_kw)
+
         while True:
             rng.shuffle(my_members)
             for tar_key, member_path, offset, size in my_members:
                 try:
-                    resp = self._client().get_object(
+                    resp = s3.get_object(
                         Bucket=self.s3_bucket, Key=tar_key,
                         Range=f"bytes={offset}-{offset + size - 1}")
                     video_bytes = resp["Body"].read()
