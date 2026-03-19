@@ -899,7 +899,22 @@ def encode_frame(
                 if encoded.cbf:
                     stats["cbf_count"] += 1
                     stats["total_coeffs"] += np.count_nonzero(encoded.coeffs)
-            if native_minimal_syntax and is_luma:
+            # inter decision tokens (Option B: raw MV as MVD, no MVP)
+            is_inter = is_luma and encoded.inter_mode != "intra"
+            if is_inter:
+                mv_x, mv_y = encoded.motion_vector or (0, 0)
+                skip_val = 1 if (not encoded.cbf and mv_x == 0 and mv_y == 0) else 0
+                cabac.trace_symbol("skip_flag", skip_val, 2)
+                cabac.encode_bin(skip_val, contexts["skip_flag"][0])
+                if skip_val == 1:
+                    continue
+                cabac.trace_symbol("merge_flag", 0, 2)
+                cabac.encode_bin(0, contexts["merge_flag"][0])
+                cabac.trace_symbol("mvd_x", mv_x, 0)
+                cabac.encode_bypass(1 if mv_x < 0 else 0)
+                cabac.trace_symbol("mvd_y", mv_y, 0)
+                cabac.encode_bypass(1 if mv_y < 0 else 0)
+            if native_minimal_syntax and is_luma and not is_inter:
                 cabac.trace_symbol("split_cu_flag", 0, 2)
                 cabac.encode_bin(0, contexts["split_cu_flag"][0])
                 cabac.trace_symbol("part_mode", 0, 2)

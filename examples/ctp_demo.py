@@ -302,13 +302,23 @@ def _rgb_to_yuv420(rgb, w, h):
 # -- encode -> traces ---------------------------------------------------------
 
 
-def encode_symbol_traces(frames, qp, max_cu_size):
+def encode_symbol_traces(frames, qp, max_cu_size, frames_per_video=None):
     config = HEVCConfig(width=frames[0].width, height=frames[0].height,
                         qp=qp, max_cu_size=max_cu_size)
     traces = []
+    ref_frames = []
     for poc, frame in enumerate(frames):
-        _, _, stats = encode_frame(frame, config, fast_mode=True, trace=True, poc=poc)
+        # reset references at video boundaries for multi-video runs
+        if frames_per_video and poc % frames_per_video == 0:
+            ref_frames = []
+        frame_type = "I" if not ref_frames else "P"
+        refs = ref_frames[-1:] if frame_type != "I" else None
+        _, recon, stats = encode_frame(
+            frame, config, fast_mode=True, trace=True, poc=poc,
+            reference_frames=refs, frame_type=frame_type,
+        )
         traces.append(stats["symbol_trace"])
+        ref_frames.append(recon)
     return traces
 
 
@@ -656,7 +666,7 @@ def main():
     # -- step 2: encode symbol traces --
     print("[2] encoding symbol traces")
     t0 = time.monotonic()
-    traces = encode_symbol_traces(frames, args.qp, args.max_cu_size)
+    traces = encode_symbol_traces(frames, args.qp, args.max_cu_size, args.frames_per_video)
     encode_time = time.monotonic() - t0
     total_tokens = sum(len(tr) for tr in traces)
     print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")
