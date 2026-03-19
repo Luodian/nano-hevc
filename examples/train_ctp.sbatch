@@ -34,6 +34,8 @@ fi
 export WANDB_DIR="/tmp/wandb"
 mkdir -p "${WANDB_DIR}"
 
+export PYTHONUNBUFFERED=1
+
 echo "=== CTP training on howto100m ==="
 echo "node: $(hostname)"
 echo "gpu:  $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
