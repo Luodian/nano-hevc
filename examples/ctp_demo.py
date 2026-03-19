@@ -3,8 +3,9 @@
 Minimal CTP trainer in the spirit of nanoGPT.
 
 Pipeline:
-  1. Load video frames (local file or Lance-indexed S3 tars from howto100m)
-  2. RGB -> YUV420 -> nano-hevc encode (trace=True) -> symbol token sequences
+  1. Load video (local file or Lance-indexed S3 tars from howto100m)
+  2. Extract H.264/MPEG-4 token sequences from bitstream (via PyAV MV export)
+     fallback: RGB -> YUV420 -> nano-hevc re-encode (trace=True), slower
   3. Split traces into train / val
   4. Train a causal Transformer with typed heads
   5. Report validation BPT against simple baselines
@@ -22,6 +23,7 @@ import json
 import math
 import os
 import random
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
