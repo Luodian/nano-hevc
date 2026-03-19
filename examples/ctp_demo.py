@@ -1469,22 +1469,33 @@ def main():
                          if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS]
         random.shuffle(video_members)
 
-        print(f"[2] extracting MPEG-4 traces from {args.num_videos} videos")
+        print(f"[2] extracting MPEG-4 traces from {args.num_videos} videos (16 threads)")
         t0 = time.monotonic()
         n_ok = n_fail = 0
-        for tk, mp, off, sz in video_members[:args.num_videos]:
+        selected = video_members[:args.num_videos]
+
+        def _fetch_and_extract(item):
+            tk, mp, off, sz = item
             try:
                 resp = client.get_object(Bucket=args.s3_bucket, Key=tk,
                                          Range=f"bytes={off}-{off + sz - 1}")
                 raw = resp["Body"].read()
-                vtraces = extract_mpeg4_traces_from_bytes(raw, args.frames_per_video, args.fps)
-                if vtraces:
-                    traces.extend(vtraces)
+                return extract_mpeg4_traces_from_bytes(raw, args.frames_per_video, args.fps)
+            except Exception:
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futs = {pool.submit(_fetch_and_extract, item): item for item in selected}
+            for fut in as_completed(futs):
+                result = fut.result()
+                if result:
+                    traces.extend(result)
                     n_ok += 1
                 else:
                     n_fail += 1
-            except Exception:
-                n_fail += 1
+                if (n_ok + n_fail) % 200 == 0:
+                    print(f"    progress: {n_ok + n_fail}/{len(selected)} ({n_ok} ok)")
         encode_time = time.monotonic() - t0
         print(f"    {n_ok} videos ok, {n_fail} failed")
         source_label = f"lance:{','.join(args.datasets)} ({n_ok} videos)"
