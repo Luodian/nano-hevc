@@ -1444,52 +1444,86 @@ def main():
         _run_streaming(args, device, wandb_run)
         return
 
-    # -- batch mode: step 1 load frames --
-    if args.lance_uri:
+    # -- batch mode: step 1+2 load data and extract traces --
+    frames = None
+    traces = []
+
+    if args.lance_uri and args.codec_mode == "mpeg4":
+        # fast path: fetch raw bytes -> extract MPEG-4 traces directly (no pixel decode)
         print(f"[1] loading Lance manifest from {args.lance_uri}")
-        print(f"    datasets={args.datasets}")
-        manifest = load_manifest_from_lance(
-            args.lance_uri, args.datasets, args.s3_endpoint
-        )
-        n_tars = len(manifest)
+        manifest = load_manifest_from_lance(args.lance_uri, args.datasets, args.s3_endpoint)
         n_members = sum(len(v) for v in manifest.values())
-        print(f"    {n_tars} tars, {n_members:,} members")
+        print(f"    {len(manifest)} tars, {n_members:,} members")
 
-        print(
-            f"    sampling {args.num_videos} videos, {args.frames_per_video} frames each -> {args.width}x{args.height}"
-        )
+        import boto3
+        from botocore.config import Config as BotoConfig
+        endpoint = args.s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+        ckw = {"config": BotoConfig(connect_timeout=30, read_timeout=300, retries={"max_attempts": 3})}
+        if endpoint:
+            ckw["endpoint_url"] = endpoint
+        client = boto3.client("s3", **ckw)
+
+        video_members = [(tk, mp, off, sz)
+                         for tk, members in manifest.items()
+                         for mp, off, sz in members
+                         if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS]
+        random.shuffle(video_members)
+
+        print(f"[2] extracting MPEG-4 traces from {args.num_videos} videos")
+        t0 = time.monotonic()
+        n_ok = n_fail = 0
+        for tk, mp, off, sz in video_members[:args.num_videos]:
+            try:
+                resp = client.get_object(Bucket=args.s3_bucket, Key=tk,
+                                         Range=f"bytes={off}-{off + sz - 1}")
+                raw = resp["Body"].read()
+                vtraces = extract_mpeg4_traces_from_bytes(raw, args.frames_per_video, args.fps)
+                if vtraces:
+                    traces.extend(vtraces)
+                    n_ok += 1
+                else:
+                    n_fail += 1
+            except Exception:
+                n_fail += 1
+        encode_time = time.monotonic() - t0
+        print(f"    {n_ok} videos ok, {n_fail} failed")
+        source_label = f"lance:{','.join(args.datasets)} ({n_ok} videos)"
+
+    elif args.lance_uri:
+        # HEVC re-encode path via Lance
+        print(f"[1] loading Lance manifest from {args.lance_uri}")
+        manifest = load_manifest_from_lance(args.lance_uri, args.datasets, args.s3_endpoint)
+        print(f"    {len(manifest)} tars, {sum(len(v) for v in manifest.values()):,} members")
+        print(f"    sampling {args.num_videos} videos -> {args.width}x{args.height}")
         frames, sources = load_frames_from_lance(
-            manifest,
-            args.num_videos,
-            args.frames_per_video,
-            args.width,
-            args.height,
-            args.fps,
-            args.s3_bucket,
-            args.s3_endpoint,
-        )
+            manifest, args.num_videos, args.frames_per_video,
+            args.width, args.height, args.fps, args.s3_bucket, args.s3_endpoint)
         source_label = f"lance:{','.join(args.datasets)} ({len(sources)} videos)"
+        print(f"    {len(frames)} frames loaded")
+        print(f"[2] encoding HEVC traces")
+        t0 = time.monotonic()
+        traces = encode_symbol_traces(frames, args.qp, args.max_cu_size, args.frames_per_video)
+        encode_time = time.monotonic() - t0
+
     else:
+        # local file
         print(f"[1] loading {args.frames_per_video} frames from {args.video}")
-        frames = load_video_frames(
-            args.video, args.frames_per_video, args.width, args.height, args.fps
-        )
         source_label = args.video.name
-
-    print(f"    {len(frames)} frames loaded")
-
-    # -- step 2: extract/encode symbol traces --
-    print(f"[2] extracting traces (codec_mode={args.codec_mode})")
-    t0 = time.monotonic()
-    if args.codec_mode == "mpeg4":
-        traces = extract_mpeg4_traces_from_video(
-            args.video, args.frames_per_video, args.fps)
-        if traces is None:
-            traces = []
-    else:
-        traces = encode_symbol_traces(
-            frames, args.qp, args.max_cu_size, args.frames_per_video)
-    encode_time = time.monotonic() - t0
+        if args.codec_mode == "mpeg4":
+            print(f"[2] extracting MPEG-4 traces")
+            t0 = time.monotonic()
+            traces = extract_mpeg4_traces_from_video(args.video, args.frames_per_video, args.fps)
+            if traces is None:
+                traces = []
+            encode_time = time.monotonic() - t0
+        else:
+            frames = load_video_frames(
+                args.video, args.frames_per_video, args.width, args.height, args.fps)
+            print(f"    {len(frames)} frames loaded")
+            print(f"[2] encoding HEVC traces")
+            t0 = time.monotonic()
+            traces = encode_symbol_traces(frames, args.qp, args.max_cu_size, args.frames_per_video)
+            encode_time = time.monotonic() - t0
     total_tokens = sum(len(tr) for tr in traces)
     print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")
 
