@@ -455,13 +455,13 @@ $$
 An LLM factorizes text as:
 
 $$
-P(w_1, w_2, \dots, w_T) = \prod_{t=1}^{T} P(w_t \mid w_{<t})
+P(w_1, w_2, \dots, w_T) = \prod_{t=1}^{T} P(w_t \mid w_{\lt t})
 $$
 
 A codec language model factorizes the token sequence identically:
 
 $$
-P(\mathbf{z}) = \prod_{t=1}^{T} P(z_t \mid z_{<t})
+P(\mathbf{z}) = \prod_{t=1}^{T} P(z_t \mid z_{\lt t})
 $$
 
 The current CTP model conditions on previous tokens and positional features (macroblock coordinates, POC). Reference frame pixels are not explicitly fed to the model — the codec's macroblock decisions already encode motion information implicitly.
@@ -469,20 +469,20 @@ The current CTP model conditions on previous tokens and positional features (mac
 The negative log-likelihood equals the total bitrate in bits:
 
 $$
-R = -\sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t})
+R = -\sum_{t=1}^{T} \log_2 P(z_t \mid z_{\lt t})
 $$
 
 Normalized per token, this is **Bits Per Token (BPT)** — the codec analogue of perplexity:
 
 $$
-\text{BPT} = \frac{R}{T} = -\frac{1}{T} \sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t})
+\text{BPT} = \frac{R}{T} = -\frac{1}{T} \sum_{t=1}^{T} \log_2 P(z_t \mid z_{\lt t})
 $$
 
 Lower BPT = better model = fewer bits = better compression.
 
 ### 8.3 Conditional Probability Chain for One Macroblock
 
-Expanding $P(\mathbf{z}_b \mid \text{ctx})$ for a single macroblock, where $\text{ctx} = (z_{<t},\; V_{\text{ref}},\; \text{position})$:
+Expanding $P(\mathbf{z}_b \mid \text{ctx})$ for a single macroblock, where $\text{ctx} = (z_{\lt t},\; V_{\text{ref}},\; \text{position})$:
 
 $$
 P(\mathbf{z}_b \mid \text{ctx}) = P(\text{mb\_mode} \mid \text{ctx}) \;\times\;
@@ -536,7 +536,7 @@ A neural codec LM replaces this with a Transformer:
 ```
   Neural context for P(z_t):
     ┌─────────────────────────────────────────────────────┐
-    │  previous_tokens       z_{<t} (causal attention)    │
+    │  previous_tokens       z_{\lt t} (causal attention)    │
     │  type_embedding        token_type identity          │
     │  position_embedding    (mb_x, mb_y, poc)            │
     │          ↓                                          │
@@ -552,7 +552,7 @@ A neural codec LM replaces this with a Transformer:
 Both optimize the same objective:
 
 $$
-\min_\theta \;-\sum_{t=1}^{T} \log_2 P_\theta(z_t \mid z_{<t})
+\min_\theta \;-\sum_{t=1}^{T} \log_2 P_\theta(z_t \mid z_{\lt t})
 $$
 
 The difference is capacity and context window size.
@@ -562,7 +562,7 @@ The difference is capacity and context window size.
 Given a dataset of videos and their extracted token traces:
 
 $$
-\mathcal{L}(\theta) = -\mathbb{E}_{V \sim \text{data}} \left[ \sum_{t=1}^{T} \log P_\theta(z_t \mid z_{<t}) \right]
+\mathcal{L}(\theta) = -\mathbb{E}_{V \sim \text{data}} \left[ \sum_{t=1}^{T} \log P_\theta(z_t \mid z_{\lt t}) \right]
 $$
 
 All 5 MPEG-4 token types are categorical, so the per-token loss is cross-entropy with type-conditioned heads:
@@ -578,11 +578,11 @@ where $\tau_t$ is the token type at position $t$, and $g_\theta^{(\tau)}$ is the
 | | GPT | Codec LM |
 |---|---|---|
 | token source | BPE tokenizer on text | H.264 macroblock decisions from bitstream |
-| conditioning | $w_{<t}$ | $z_{<t}$ (previous codec tokens) |
+| conditioning | $w_{\lt t}$ | $z_{\lt t}$ (previous codec tokens) |
 | vocabulary | fixed (32K–128K) | **mixed**: 5 token types with vocab 3–256 |
 | prediction head | single softmax | **multi-head**: type-conditioned dispatch |
 | metric | perplexity (PPL) | bits per token (BPT) |
-| objective | $\min -\sum \log P(w_t \mid w_{<t})$ | $\min -\sum \log P(z_t \mid z_{<t})$ |
+| objective | $\min -\sum \log P(w_t \mid w_{\lt t})$ | $\min -\sum \log P(z_t \mid z_{\lt t})$ |
 
 ### 8.7 Concrete Example: birds.mp4 Frame 4 (P-Frame)
 
@@ -621,7 +621,7 @@ A good neural model should achieve:
 The same factorization applies. B-frames use `frame_type=2` and the motion vectors extracted from the bitstream already reflect bidirectional prediction. FFmpeg's motion vector export reports L0 and L1 motion vectors as separate entries per macroblock — we flatten them into the same `(mv_x, mv_y)` token pairs, and the model learns the L0/L1 distinction implicitly from sequence position and frame_type context.
 
 $$
-P(\mathbf{z}^B) = P(\text{frame\_type}=B) \;\times\; \prod_{b=1}^{N_{\text{MB}}} P(\mathbf{z}_b \mid z_{<b},\; \text{frame\_type}=B)
+P(\mathbf{z}^B) = P(\text{frame\_type}=B) \;\times\; \prod_{b=1}^{N_{\text{MB}}} P(\mathbf{z}_b \mid z_{\lt b},\; \text{frame\_type}=B)
 $$
 
 In practice, B-frame MBs have higher skip rates (bidirectional prediction is more accurate), so the token sequences are shorter — matching the bit allocation pattern from section 5 where B-frames are 1/3 the size of I-frames.
