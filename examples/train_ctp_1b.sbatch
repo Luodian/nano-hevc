@@ -19,7 +19,7 @@ set -euo pipefail
 REPO="$HOME/codebase/nano-hevc"
 cd "${REPO}"
 
-pip install -e . --quiet 2>&1 | tail -1
+pip install av -e . --quiet 2>&1 | tail -1
 
 # S3 + W&B credentials
 export S3_ENDPOINT_URL="https://storage.eu-north1.nebius.cloud"
@@ -42,6 +42,7 @@ echo "started: $(date -Iseconds)"
 # 500 videos x 8 frames = 4000 frames -> ~2.8M tokens
 # H200 80GB: bf16 fits comfortably
 python examples/ctp_demo.py \
+    --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_video_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \

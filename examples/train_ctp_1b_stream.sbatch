@@ -19,7 +19,7 @@ set -euo pipefail
 REPO="$HOME/codebase/nano-hevc"
 cd "${REPO}"
 
-pip install -e . --quiet 2>&1 | tail -1
+pip install av -e . --quiet 2>&1 | tail -1
 
 # S3 + W&B
 export S3_ENDPOINT_URL="https://storage.eu-north1.nebius.cloud"
@@ -39,7 +39,7 @@ echo "cpus: $(nproc)"
 echo "started: $(date -Iseconds)"
 
 # 1B model streaming from full howto100m (~1.2M videos)
-# 16 DataLoader workers handle S3 fetch + decode + HEVC encode in parallel
+# 16 DataLoader workers handle S3 fetch + H.264 token extraction in parallel
 # GPU trains on the stream with bf16 AMP
 python examples/ctp_demo.py \
     --streaming \

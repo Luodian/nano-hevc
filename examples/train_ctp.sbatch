@@ -20,7 +20,7 @@ REPO="$HOME/codebase/nano-hevc"
 cd "${REPO}"
 
 # install nano-hevc in the container
-pip install -e . --quiet 2>&1 | tail -1
+pip install av -e . --quiet 2>&1 | tail -1
 
 # S3 credentials and endpoint (Nebius Object Storage)
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials"
@@ -42,6 +42,7 @@ echo "gpu:  $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "started: $(date -Iseconds)"
 
 python examples/ctp_demo.py \
+    --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_video_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
