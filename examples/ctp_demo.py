@@ -1339,7 +1339,8 @@ def _run_streaming(args, device, wandb_run):
         stream_dataset, batch_size=args.batch_size,
         num_workers=nw, pin_memory=True,
         persistent_workers=nw > 0,
-        prefetch_factor=2 if nw > 0 else None)
+        prefetch_factor=2 if nw > 0 else None,
+        multiprocessing_context="spawn" if nw > 0 else None)
 
     print("=" * 72)
     print("ctp streaming trainer")
