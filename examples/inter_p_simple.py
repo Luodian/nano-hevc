@@ -43,7 +43,7 @@ BS = 8
 QP = 22
 SEARCH_RANGE = 16
 
-# per-block syntax overhead (bits) to model real HEVC signaling cost.
+# per-block syntax overhead (bits) to model real H.264/HEVC signaling cost.
 # I blocks: split_cu + part_mode + intra_mode + cbf ≈ 6 bits
 # P/B blocks: skip/merge signaling ≈ 2 bits (MV cost added separately)
 I_SYNTAX_BITS = 6

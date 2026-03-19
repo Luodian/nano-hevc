@@ -394,50 +394,60 @@ Spatial distribution of block types for birds.mp4 frame 4:
 
 ---
 
-## 8. Autoregressive Prediction Target for P-Frames
+## 8. Autoregressive Prediction Target: Codec Token Sequences
 
 Sections 1–7 describe the traditional codec pipeline. This section bridges to neural compression by showing that the codec's output is a **token sequence** with a well-defined autoregressive probability structure — the same structure that LLMs use.
 
 ### 8.1 Codec Output as Token Sequence
 
-The HEVC encoder does not output raw pixels. It outputs a sequence of **syntax elements** (decisions) that the decoder replays to reconstruct the frame. nano-hevc's `SymbolTrace` captures exactly this sequence:
+The H.264 encoder does not output raw pixels. It outputs a sequence of **syntax elements** (decisions) that the decoder replays to reconstruct the frame. We extract these decisions directly from the compressed bitstream via FFmpeg's motion vector export API — no re-encoding needed. Each decision is captured as a `SymbolTrace`:
 
 ```python
 class SymbolTrace(NamedTuple):
     poc: int          # frame index
-    cu_x: int         # block x coordinate
-    cu_y: int         # block y coordinate
-    cu_size: int      # block size
-    plane: str        # "Y", "U", "V"
+    cu_x: int         # macroblock x coordinate (pixels)
+    cu_y: int         # macroblock y coordinate (pixels)
+    cu_size: int      # block size (16 for H.264 macroblocks)
+    plane: str        # "Y"
     token_type: str   # syntax element name
     value: int        # ground-truth value
-    vocab_size: int   # number of possible values (0 = open-ended)
+    vocab_size: int   # number of possible values
 ```
 
-For an I-frame block, the token sub-sequence is:
+Token vocabulary (5 types, all categorical):
+
+| token_type | vocab | values | when emitted |
+|---|---|---|---|
+| frame_type | 3 | I=0, P=1, B=2 | 1 per frame |
+| mb_mode | 3 | intra=0, inter=1, skip=2 | 1 per macroblock |
+| partition_mode | 4 | 16x16=0, 16x8=1, 8x16=2, 8x8=3 | inter MBs only |
+| mv_x | 256 | nonlinear 256-bin discretization | per sub-partition |
+| mv_y | 256 | nonlinear 256-bin discretization | per sub-partition |
+
+Per-frame token sequence = frame_type, then per-MB in raster scan order:
 
 ```
-z_block^I = (split_cu, part_mode, intra_mode, cbf,
-             last_x, last_y, sig₀, sig₁, …, gt1₀, …,
-             gt2₀, …, sign₀, …, remaining₀, …)
+z_frame = (frame_type,
+           mb_mode₀, [partition_mode₀, mv_x₀₀, mv_y₀₀, …]?,
+           mb_mode₁, [partition_mode₁, mv_x₁₀, mv_y₁₀, …]?,
+           …)
 ```
 
-For a P-frame block, the prediction source changes from spatial neighbors to temporal reference + motion vector:
+where `?` denotes conditional presence — skip/intra MBs emit only `mb_mode` (1 token), inter MBs emit `mb_mode + partition_mode + MV pairs` (variable length, 4–11 tokens depending on partition).
+
+Per-MB token count by mode:
 
 ```
-z_block^P = (skip_flag,
-             merge_flag?, merge_idx?,
-             mvd_x?, mvd_y?,
-             cbf,
-             last_x?, last_y?, sig?, gt1?, gt2?, sign?, remaining?)
+skip:    mb_mode                                            = 1 token
+intra:   mb_mode                                            = 1 token
+inter:   mb_mode + partition_mode + N × (mv_x, mv_y)       = 3–11 tokens
+         where N = {1, 2, 2, 4} for {16x16, 16x8, 8x16, 8x8}
 ```
 
-where `?` denotes conditional presence — `skip=1` terminates the sequence immediately, `cbf=0` omits all coefficient tokens.
-
-The complete P-frame token sequence is the concatenation over all blocks in raster scan order:
+The complete frame token sequence is the concatenation:
 
 $$
-\mathbf{z} = (z_1, z_2, \dots, z_T), \quad T = \sum_{b=1}^{N_{\text{blocks}}} |\mathbf{z}_b|
+\mathbf{z} = (z_1, z_2, \dots, z_T), \quad T = 1 + \sum_{b=1}^{N_{\text{MB}}} |\mathbf{z}_b|
 $$
 
 ### 8.2 Autoregressive Factorization
@@ -448,95 +458,76 @@ $$
 P(w_1, w_2, \dots, w_T) = \prod_{t=1}^{T} P(w_t \mid w_{<t})
 $$
 
-A codec language model factorizes the P-frame token sequence identically, with one addition — conditioning on the reference frame $V_{\text{ref}}$:
+A codec language model factorizes the token sequence identically:
 
 $$
-P(\mathbf{z} \mid V_{\text{ref}}) = \prod_{t=1}^{T} P(z_t \mid z_{<t},\; V_{\text{ref}})
+P(\mathbf{z}) = \prod_{t=1}^{T} P(z_t \mid z_{<t})
 $$
+
+The current CTP model conditions on previous tokens and positional features (macroblock coordinates, POC). Reference frame pixels are not explicitly fed to the model — the codec's macroblock decisions already encode motion information implicitly.
 
 The negative log-likelihood equals the total bitrate in bits:
 
 $$
-R = -\sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t},\; V_{\text{ref}})
+R = -\sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t})
 $$
 
 Normalized per token, this is **Bits Per Token (BPT)** — the codec analogue of perplexity:
 
 $$
-\text{BPT} = \frac{R}{T} = -\frac{1}{T} \sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t},\; V_{\text{ref}})
+\text{BPT} = \frac{R}{T} = -\frac{1}{T} \sum_{t=1}^{T} \log_2 P(z_t \mid z_{<t})
 $$
 
 Lower BPT = better model = fewer bits = better compression.
 
-### 8.3 Conditional Probability Chain for One P-Frame Block
+### 8.3 Conditional Probability Chain for One Macroblock
 
-Expanding $P(\mathbf{z}_b \mid \text{ctx})$ for a single block, where $\text{ctx} = (z_{<t},\; V_{\text{ref}},\; \text{position})$:
+Expanding $P(\mathbf{z}_b \mid \text{ctx})$ for a single macroblock, where $\text{ctx} = (z_{<t},\; V_{\text{ref}},\; \text{position})$:
 
 $$
-P(\mathbf{z}_b \mid \text{ctx}) = P(\text{skip} \mid \text{ctx}) \;\times\;
+P(\mathbf{z}_b \mid \text{ctx}) = P(\text{mb\_mode} \mid \text{ctx}) \;\times\;
 \begin{cases}
-1 & \text{if skip}=1 \\[6pt]
-P(\text{merge} \mid \text{ctx}) \;\times\; P(\mathbf{mv} \mid \text{ctx}) \;\times\; P(\text{cbf} \mid \text{ctx}) \;\times\;
-\begin{cases}
-1 & \text{if cbf}=0 \\[4pt]
-\displaystyle\prod_{i} P(c_i \mid \text{ctx}) & \text{if cbf}=1
-\end{cases}
-& \text{if skip}=0
+1 & \text{if mode} \in \{\text{skip, intra}\} \\[6pt]
+P(\text{part} \mid \text{ctx}) \;\times\; \displaystyle\prod_{k=1}^{N_{\text{part}}} P(\text{mv\_x}_k \mid \text{ctx}) \cdot P(\text{mv\_y}_k \mid \text{ctx})
+& \text{if mode} = \text{inter}
 \end{cases}
 $$
 
-where $\{c_i\}$ is the coefficient token sub-sequence (last_x, last_y, sig flags, gt1, gt2, signs, remaining).
+where $N_{\text{part}} \in \{1, 2, 2, 4\}$ for partition modes $\{$16x16, 16x8, 8x16, 8x8$\}$.
 
-Each token maps to a specific distribution family based on its `vocab_size`:
+Each token type maps to a categorical distribution:
 
 | token_type | vocab | distribution | role |
 |---|---|---|---|
-| skip_flag | 2 | $\text{Bernoulli}$ | block identical to ref? if 1, entire block done — 1 bit, zero cost |
-| merge_flag | 2 | $\text{Bernoulli}$ | reuse a neighbor block's MV? avoids transmitting MV explicitly |
-| merge_idx | 5 | $\text{Categorical}_5$ | which neighbor's MV to reuse (left / above / above-right / below-left / temporal) |
-| mvd_x | 0 (open) | $\text{DiscretizedLogistic}(\mu, s)$ | MV residual in x: actual_MV_x = predicted_MV_x + mvd_x |
-| mvd_y | 0 (open) | $\text{DiscretizedLogistic}(\mu, s)$ | MV residual in y: actual_MV_y = predicted_MV_y + mvd_y |
-| cbf | 2 | $\text{Bernoulli}$ | any non-zero DCT coefficient in this block? if 0, no coefficients transmitted |
-| last_sig_x | $K$ | $\text{Categorical}_K$ | x-coordinate of the last non-zero coeff in scan order; everything after is zero |
-| last_sig_y | $K$ | $\text{Categorical}_K$ | y-coordinate of the last non-zero coeff; together with last_x, sets the scan endpoint |
-| sig_coeff_flag | 2 | $\text{Bernoulli}$ | is this scan position non-zero? one flag per position from last_pos back to 0 |
-| coeff_gt1 | 2 | $\text{Bernoulli}$ | is \|coeff\| > 1? most quantized coefficients are ±1, so gt1=0 is dominant |
-| coeff_gt2 | 2 | $\text{Bernoulli}$ | is \|coeff\| > 2? peels another layer; only for coefficients already known > 1 |
-| coeff_sign | 2 | $\text{Bernoulli}(0.5)$ | positive or negative? statistically near-uniform, coded in CABAC bypass mode |
-| coeff_remaining | 0 (open) | $\text{DiscretizedLogistic}(\mu, s)$ | leftover magnitude: \|coeff\| − 3; only when \|coeff\| > 2; Rice-Golomb coded |
+| frame_type | 3 | $\text{Categorical}_3$ | I=0, P=1, B=2; 1 per frame, sets context for all MBs |
+| mb_mode | 3 | $\text{Categorical}_3$ | intra=0, inter=1, skip=2; skip/intra terminate the MB immediately |
+| partition_mode | 4 | $\text{Categorical}_4$ | sub-block layout: 16x16, 16x8, 8x16, 8x8; determines MV count |
+| mv_x | 256 | $\text{Categorical}_{256}$ | horizontal motion, nonlinear bins (fine near zero, coarse in tails) |
+| mv_y | 256 | $\text{Categorical}_{256}$ | vertical motion, same binning as mv_x |
 
-Token types are ordered by the encoding decision tree. A P-frame block with quantized coefficients `[+5, -2, 0, +1, 0, ...]` produces:
+The MV binning is nonlinear to match the real distribution of motion vectors — most are near zero (static/slow motion), few are large (fast motion):
 
 ```
-skip=0 → merge=0 → mvd=(+1,+1) → cbf=1
-  → last_x=3, last_y=0                  locate scan endpoint
-  → sig=[0,1,1]                         which positions are non-zero
-  → gt1=[1,1,0]                         peel layer: |coeff|>1?
-  → gt2=[1,0]                           peel layer: |coeff|>2?
-  → sign=[0,1,0]                        +5 is positive, -2 is negative, +1 is positive
-  → remaining=[2]                        |5|-3=2
-  = 19 tokens total
-
-  decoder reconstructs:
-    sig=1, gt1=1, gt2=1, remaining=2, sign=0 → +1+1+1+2 = +5  ✓
-    sig=1, gt1=1, gt2=0,             sign=1 → -(1+1)   = -2  ✓
-    sig=0                                   →            =  0  ✓
-    sig=1, gt1=0,                     sign=0 → +1       = +1  ✓
+bins   0-127:  values [-64, +63]     at 1x resolution (quarter-pel)
+bins 128-191:  values [-192, -65]    at 2x step
+               values [+64, +191]
+bins 192-255:  values [-704, -193]   at 8x step
+               values [+192, +703]
 ```
 
-The "onion peeling" strategy is critical: most coefficients are 0 (eliminated by sig_coeff_flag), most non-zero coefficients are ±1 (eliminated by coeff_gt1), and only a tiny fraction reach coeff_remaining. Each layer acts as a **sparsity filter**, with the early binary tokens handling the common case cheaply.
+The **variable-length** property is key: skip and intra MBs cost 1 token, while a complex 8x8-partitioned inter MB costs 11 tokens. This naturally allocates modeling capacity to motion-rich regions — the same principle as HEVC's skip flag, but at macroblock granularity.
 
-### 8.4 CABAC as a Minimal Autoregressive Model
+### 8.4 Traditional Context Models vs Neural LM
 
-CABAC is already an autoregressive model — a very simple one. It estimates $P(z_t \mid \text{ctx})$ using a 64-state lookup table indexed by a handful of handcrafted context features:
+H.264's entropy coder (CABAC in High profile) is already an autoregressive model — a very simple one. It estimates $P(z_t \mid \text{ctx})$ using a 64-state lookup table indexed by a handful of handcrafted context features:
 
 ```
-  CABAC context for P(sig_coeff_flag_i):
-    features = (neighbor significance flags, scan position, block size)
+  CABAC context for P(mb_mode):
+    features = (neighbor MB modes, slice type, position)
     → index into 64-state probability table
-    → outputs one Bernoulli probability
+    → outputs one categorical probability
 
-  context window: ~3 neighboring flags
+  context window: ~3 neighboring MBs
   model capacity: 64 states × ~50 context indices ≈ 3,200 parameters
 ```
 
@@ -545,114 +536,92 @@ A neural codec LM replaces this with a Transformer:
 ```
   Neural context for P(z_t):
     ┌─────────────────────────────────────────────────────┐
-    │  ref_frame_patches     V_ref → patch tokens (prefix)│
     │  previous_tokens       z_{<t} (causal attention)    │
-    │  position_embedding    (cu_x, cu_y, plane, type)    │
+    │  type_embedding        token_type identity          │
+    │  position_embedding    (mb_x, mb_y, poc)            │
     │          ↓                                          │
-    │  Transformer(prefix + causal sequence)              │
+    │  Transformer(causal sequence)                       │
     │          ↓                                          │
     │  h_t → type-conditioned prediction head             │
     └─────────────────────────────────────────────────────┘
 
-  context window: entire reference frame + all previous tokens
+  context window: all previous tokens in the frame
   model capacity: ~10M–1B parameters
 ```
 
 Both optimize the same objective:
 
 $$
-\min_\theta \;-\sum_{t=1}^{T} \log_2 P_\theta(z_t \mid z_{<t},\; V_{\text{ref}})
+\min_\theta \;-\sum_{t=1}^{T} \log_2 P_\theta(z_t \mid z_{<t})
 $$
 
 The difference is capacity and context window size.
 
 ### 8.5 Training Objective
 
-Given a dataset of video frames and their encoder traces:
+Given a dataset of videos and their extracted token traces:
 
 $$
-\mathcal{L}(\theta) = -\mathbb{E}_{V \sim \text{data}} \left[ \sum_{t=1}^{T} \log P_\theta(z_t \mid z_{<t},\; V_{\text{ref}}) \right]
+\mathcal{L}(\theta) = -\mathbb{E}_{V \sim \text{data}} \left[ \sum_{t=1}^{T} \log P_\theta(z_t \mid z_{<t}) \right]
 $$
 
-The per-token loss dispatches on `token_type`:
+All 5 MPEG-4 token types are categorical, so the per-token loss is cross-entropy with type-conditioned heads:
 
 $$
-\ell_t =
-\begin{cases}
--\log \sigma(f_\theta(\mathbf{h}_t)) \cdot z_t - \log(1 - \sigma(f_\theta(\mathbf{h}_t))) \cdot (1-z_t)
-  & \text{if } \text{vocab} = 2 \;\text{(BCE)} \\[6pt]
--\log \text{softmax}(g_\theta(\mathbf{h}_t))_{z_t}
-  & \text{if } \text{vocab} > 2 \;\text{(CE)} \\[6pt]
--\log p_{\text{DL}}(z_t \mid \mu_\theta(\mathbf{h}_t),\; s_\theta(\mathbf{h}_t))
-  & \text{if } \text{vocab} = 0 \;\text{(open-ended)}
-\end{cases}
+\ell_t = -\log \text{softmax}(g_\theta^{(\tau_t)}(\mathbf{h}_t))_{z_t}
 $$
 
-where $p_{\text{DL}}$ is the discretized logistic likelihood, and $f_\theta, g_\theta, \mu_\theta, s_\theta$ are type-conditioned heads sharing the same Transformer backbone.
+where $\tau_t$ is the token type at position $t$, and $g_\theta^{(\tau)}$ is the prediction head for type $\tau$. Each head outputs logits of dimension equal to that type's vocabulary size (3, 3, 4, 256, or 256). All heads share the same Transformer backbone $\mathbf{h}_t$.
 
 ### 8.6 Comparison: GPT vs Codec LM
 
 | | GPT | Codec LM |
 |---|---|---|
-| token source | BPE tokenizer on text | CABAC syntax elements from encoder |
-| conditioning | $w_{<t}$ | $z_{<t}$ + $V_{\text{ref}}$ (reference frame) |
-| vocabulary | fixed (32K–128K) | **mixed**: each `token_type` has different vocab |
+| token source | BPE tokenizer on text | H.264 macroblock decisions from bitstream |
+| conditioning | $w_{<t}$ | $z_{<t}$ (previous codec tokens) |
+| vocabulary | fixed (32K–128K) | **mixed**: 5 token types with vocab 3–256 |
 | prediction head | single softmax | **multi-head**: type-conditioned dispatch |
 | metric | perplexity (PPL) | bits per token (BPT) |
-| objective | $\min -\sum \log P(w_t \mid w_{<t})$ | $\min -\sum \log P(z_t \mid z_{<t}, V_{\text{ref}})$ |
+| objective | $\min -\sum \log P(w_t \mid w_{<t})$ | $\min -\sum \log P(z_t \mid z_{<t})$ |
 
 ### 8.7 Concrete Example: birds.mp4 Frame 4 (P-Frame)
 
-Applying the formulation to the actual P-frame:
+Applying the formulation to the actual P-frame. Frame starts with `frame_type=1` (P), then per-MB in raster scan:
 
 ```
-block(0,0) sky:     z = [skip=1]                               1 token
-block(0,1) sky:     z = [skip=1]                               1 token
+frame_type=P                                                    1 token
+MB(0,0)  sky:     z = [mb_mode=skip]                            1 token
+MB(1,0)  sky:     z = [mb_mode=skip]                            1 token
   ...
-block(5,8) bird:    z = [skip=0, merge=0, mvd=(+2,-1),        ~20 tokens
-                         cbf=1, last_x=3, last_y=2,
-                         sig=1,0,1,0,…, gt1=1,0,…,
-                         sign=0,1,…, remaining=2,…]
+MB(5,8)  bird:    z = [mb_mode=inter, partition=8x8,            11 tokens
+                       mv_x₀=bin(+2), mv_y₀=bin(-1),
+                       mv_x₁=bin(+3), mv_y₁=bin(0),
+                       mv_x₂=bin(+1), mv_y₂=bin(-2),
+                       mv_x₃=bin(+2), mv_y₃=bin(-1)]
   ...
 ```
 
 ```
-  cost per block type:
+  cost per MB type:
 
-  sky block:     P(skip=1 | ctx) ≈ 0.99
-                 → −log₂(0.99) ≈ 0.015 bits        virtually free
+  sky MB:      P(mb_mode=skip | ctx) ≈ 0.99
+               → −log₂(0.99) ≈ 0.015 bits          virtually free (1 token)
 
-  bird block:    ~20 tokens × 0.5–8 bits each
-                 → ~30–80 bits per block              all budget here
+  bird MB:     11 tokens, each 0.5–8 bits
+               → ~20–50 bits per MB                   all budget here
 ```
 
 A good neural model should achieve:
-- near-zero BPT on sky blocks (trivial to predict skip=1)
-- low BPT on bird blocks by leveraging reference frame attention (implicit motion compensation)
-- total BPT well below the CABAC baseline (which uses only local context)
+- near-zero BPT on sky MBs (trivial to predict skip)
+- low BPT on bird MBs by learning motion patterns from preceding tokens
+- total BPT well below the uniform baseline (which ignores all context)
 
 ### 8.8 Extension to B-Frames
 
-The same factorization applies. The token sequence gains a second MV:
+The same factorization applies. B-frames use `frame_type=2` and the motion vectors extracted from the bitstream already reflect bidirectional prediction. FFmpeg's motion vector export reports L0 and L1 motion vectors as separate entries per macroblock — we flatten them into the same `(mv_x, mv_y)` token pairs, and the model learns the L0/L1 distinction implicitly from sequence position and frame_type context.
 
 $$
-\mathbf{z}_b^B = (\text{skip},\; \mathbf{mv}_{L0}?,\; \mathbf{mv}_{L1}?,\; \text{cbf},\; \{c_i\}?)
+P(\mathbf{z}^B) = P(\text{frame\_type}=B) \;\times\; \prod_{b=1}^{N_{\text{MB}}} P(\mathbf{z}_b \mid z_{<b},\; \text{frame\_type}=B)
 $$
 
-and the conditioning includes two reference frames:
-
-$$
-P(\mathbf{z}^B \mid V_{\text{ref}}^{L0},\; V_{\text{ref}}^{L1}) = \prod_{t=1}^{T} P(z_t \mid z_{<t},\; V_{\text{ref}}^{L0},\; V_{\text{ref}}^{L1})
-$$
-
-For the iGPT-style architecture, both references become prefix tokens:
-
-```
-  input sequence:
-  [ref_L0_patch₁, …, ref_L0_patchN, SEP,
-   ref_L1_patch₁, …, ref_L1_patchN, SEP,
-   z₁, z₂, …, z_T]
-   \___ prefix (bidirectional) ___/  \_ causal generate _/
-```
-
-The Transformer's attention pattern implicitly learns which reference to rely on per block — equivalent to the L0/L1/bi-pred mode selection in traditional codecs, but without hard-coded averaging.
+In practice, B-frame MBs have higher skip rates (bidirectional prediction is more accurate), so the token sequences are shorter — matching the bit allocation pattern from section 5 where B-frames are 1/3 the size of I-frames.
