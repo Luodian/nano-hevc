@@ -88,6 +88,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", action="store_true",
                    help="use bf16 automatic mixed precision")
 
+    # streaming (full dataset training)
+    p.add_argument("--streaming", action="store_true",
+                   help="stream videos from Lance/S3 instead of loading all upfront")
+    p.add_argument("--streaming-workers", type=int, default=8,
+                   help="DataLoader workers for streaming")
+    p.add_argument("--warmup-frames", type=int, default=32,
+                   help="frames to encode for head_spec discovery")
+    p.add_argument("--eval-videos", type=int, default=50,
+                   help="held-out videos for eval")
+
     # model
     p.add_argument("--n-layer", type=int, default=4)
     p.add_argument("--n-head", type=int, default=4)
@@ -535,6 +545,230 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
     )
 
 
+# -- streaming dataset --------------------------------------------------------
+
+
+def tensorize_trace(trace, type_to_id, head_specs, value_limit, width, height):
+    """Convert a raw SymbolTrace list into tensors. Shared by batch and streaming modes."""
+    value_vocab_size = value_limit * 2 + 3
+    bos_value_id = value_vocab_size - 1
+    max_poc = max(1, max(t.poc for t in trace)) if trace else 1
+    max_cu_size = max(1, max(t.cu_size for t in trace)) if trace else 8
+
+    def value_to_id(v):
+        return max(0, min(v + value_limit, value_vocab_size - 2))
+
+    n = len(trace)
+    type_ids = torch.zeros(n, dtype=torch.long)
+    targets = torch.zeros(n, dtype=torch.long)
+    vocab_sizes = torch.zeros(n, dtype=torch.long)
+    prev_value_ids = torch.full((n,), bos_value_id, dtype=torch.long)
+    aux = torch.zeros(n, 5, dtype=torch.float32)
+    learn_mask = torch.zeros(n, dtype=torch.bool)
+
+    for i, t in enumerate(trace):
+        tid = type_to_id.get(t.token_type, -1)
+        if tid < 0:
+            continue
+        type_ids[i] = tid
+        targets[i] = t.value
+        vocab_sizes[i] = t.vocab_size
+        if i > 0:
+            prev_value_ids[i] = value_to_id(trace[i - 1].value)
+        aux[i] = torch.tensor([
+            t.poc / max_poc, t.cu_x / max(width, 1), t.cu_y / max(height, 1),
+            t.cu_size / max_cu_size, PLANE_TO_ID.get(t.plane, 0) / 2.0,
+        ])
+        learn_mask[i] = head_specs[t.token_type].learn if t.token_type in head_specs else False
+
+    return type_ids, prev_value_ids, targets, vocab_sizes, aux, learn_mask
+
+
+def _make_window(type_ids, prev_value_ids, targets, vocab_sizes, aux, learn_mask,
+                 block_size, pad_type_id, bos_value_id):
+    """Take a random window of block_size from tensorized trace. Returns a batch-ready dict."""
+    n = type_ids.shape[0]
+    if n > block_size:
+        start = random.randint(0, n - block_size)
+        sl = slice(start, start + block_size)
+    else:
+        start = 0
+        sl = slice(0, n)
+
+    out_type = torch.full((block_size,), pad_type_id, dtype=torch.long)
+    out_prev = torch.full((block_size,), bos_value_id, dtype=torch.long)
+    out_tgt = torch.zeros(block_size, dtype=torch.long)
+    out_voc = torch.zeros(block_size, dtype=torch.long)
+    out_aux = torch.zeros(block_size, 5, dtype=torch.float32)
+    out_valid = torch.zeros(block_size, dtype=torch.bool)
+    out_learn = torch.zeros(block_size, dtype=torch.bool)
+
+    span = min(n, block_size)
+    out_type[:span] = type_ids[sl]
+    out_prev[:span] = prev_value_ids[sl]
+    out_tgt[:span] = targets[sl]
+    out_voc[:span] = vocab_sizes[sl]
+    out_aux[:span] = aux[sl]
+    out_valid[:span] = True
+    out_learn[:span] = learn_mask[sl]
+
+    return {
+        "type_ids": out_type, "prev_value_ids": out_prev,
+        "targets": out_tgt, "vocab_sizes": out_voc,
+        "aux": out_aux, "valid_mask": out_valid, "learn_mask": out_learn,
+    }
+
+
+class CTPStreamDataset(torch.utils.data.IterableDataset):
+    """Stream: S3 range read -> decode -> HEVC encode -> tensorize -> yield windows."""
+
+    def __init__(self, manifest, s3_bucket, s3_endpoint,
+                 width, height, frames_per_video, fps, qp, max_cu_size, block_size,
+                 type_to_id, head_specs, value_limit, seed=42):
+        super().__init__()
+        # flatten manifest into a list of (tar_key, member_path, offset, size)
+        self.video_members = [
+            (tk, mp, off, sz)
+            for tk, members in manifest.items()
+            for mp, off, sz in members
+            if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS
+        ]
+        self.s3_bucket = s3_bucket
+        self.s3_endpoint = s3_endpoint
+        self.width = width
+        self.height = height
+        self.frames_per_video = frames_per_video
+        self.fps = fps
+        self.qp = qp
+        self.max_cu_size = max_cu_size
+        self.block_size = block_size
+        self.type_to_id = type_to_id
+        self.head_specs = head_specs
+        self.value_limit = value_limit
+        self.pad_type_id = len(type_to_id)
+        self.bos_value_id = value_limit * 2 + 3 - 1
+        self.seed = seed
+        self._local = threading.local()
+        self._ok = 0
+        self._fail = 0
+
+    def _client(self):
+        if not hasattr(self._local, "client"):
+            import boto3
+            from botocore.config import Config as BotoConfig
+            kw = {"config": BotoConfig(connect_timeout=30, read_timeout=300,
+                                        retries={"max_attempts": 3})}
+            endpoint = self.s3_endpoint or os.environ.get("S3_ENDPOINT_URL")
+            if endpoint:
+                kw["endpoint_url"] = endpoint
+            self._local.client = boto3.client("s3", **kw)
+        return self._local.client
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        worker_id = wi.id if wi else 0
+        num_workers = wi.num_workers if wi else 1
+
+        # chunked shard of video members per worker
+        members = list(self.video_members)
+        n = len(members)
+        chunk = n // num_workers
+        start = worker_id * chunk
+        end = start + chunk if worker_id < num_workers - 1 else n
+        my_members = members[start:end]
+
+        rng = random.Random(self.seed + worker_id)
+        config = HEVCConfig(width=self.width, height=self.height,
+                            qp=self.qp, max_cu_size=self.max_cu_size)
+
+        while True:
+            rng.shuffle(my_members)
+            for tar_key, member_path, offset, size in my_members:
+                try:
+                    resp = self._client().get_object(
+                        Bucket=self.s3_bucket, Key=tar_key,
+                        Range=f"bytes={offset}-{offset + size - 1}")
+                    video_bytes = resp["Body"].read()
+                except Exception:
+                    self._fail += 1
+                    continue
+
+                frames = _decode_video_bytes(
+                    video_bytes, self.frames_per_video,
+                    self.width, self.height, self.fps)
+                if not frames:
+                    self._fail += 1
+                    continue
+
+                # HEVC encode each frame -> traces -> windows
+                ref_frames = []
+                for poc, frame in enumerate(frames):
+                    frame_type = "I" if not ref_frames else "P"
+                    refs = ref_frames[-1:] if frame_type != "I" else None
+                    try:
+                        _, recon, stats = encode_frame(
+                            frame, config, fast_mode=True, trace=True,
+                            poc=poc, reference_frames=refs, frame_type=frame_type)
+                    except Exception:
+                        self._fail += 1
+                        continue
+
+                    trace = stats["symbol_trace"]
+                    ref_frames.append(recon)
+                    if not trace:
+                        continue
+
+                    tensors = tensorize_trace(
+                        trace, self.type_to_id, self.head_specs,
+                        self.value_limit, self.width, self.height)
+                    window = _make_window(
+                        *tensors, self.block_size,
+                        self.pad_type_id, self.bos_value_id)
+                    self._ok += 1
+                    yield window
+
+
+def warmup_discover_specs(manifest, num_warmup_frames, s3_bucket, s3_endpoint,
+                          width, height, frames_per_video, fps, qp, max_cu_size):
+    """Encode a small set of frames to discover head_specs and value_limit."""
+    num_videos = max(1, num_warmup_frames // max(frames_per_video, 1))
+    frames, _ = load_frames_from_lance(
+        manifest, num_videos, frames_per_video,
+        width, height, fps, s3_bucket, s3_endpoint)
+    traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
+    head_specs = build_head_specs(traces)
+    value_limit = max(256, max(abs(t.value) for tr in traces for t in tr))
+    return head_specs, value_limit, traces
+
+
+def build_eval_pool(manifest, num_eval_videos, type_to_id, head_specs, value_limit,
+                    s3_bucket, s3_endpoint, width, height, frames_per_video,
+                    fps, qp, max_cu_size, seed):
+    """Pre-encode a held-out set of videos for evaluation."""
+    frames, _ = load_frames_from_lance(
+        manifest, num_eval_videos, frames_per_video,
+        width, height, fps, s3_bucket, s3_endpoint)
+    traces = encode_symbol_traces(frames, qp, max_cu_size, frames_per_video)
+
+    id_to_type = list(head_specs.keys())
+    pad_type_id = len(id_to_type)
+    value_vocab_size = value_limit * 2 + 3
+    bos_value_id = value_vocab_size - 1
+
+    tensor_traces = []
+    for trace in traces:
+        tensors = tensorize_trace(trace, type_to_id, head_specs, value_limit, width, height)
+        tensor_traces.append(TensorTrace(*tensors))
+
+    return DatasetBundle(
+        train=tensor_traces, val=tensor_traces,
+        type_to_id=type_to_id, id_to_type=id_to_type,
+        head_specs=head_specs, pad_type_id=pad_type_id,
+        bos_value_id=bos_value_id, value_vocab_size=value_vocab_size,
+        value_limit=value_limit, source="eval_pool",
+        total_tokens=sum(t.length() for t in tensor_traces))
+
+
 # -- batching -----------------------------------------------------------------
 
 
@@ -744,6 +978,157 @@ def compute_unigram_bpt(train, val, id_to_type):
     return total_bits / max(total_tokens, 1)
 
 
+# -- streaming training -------------------------------------------------------
+
+
+def _run_streaming(args, device, wandb_run):
+    """Train on full howto100m via streaming: S3 fetch -> decode -> encode -> train."""
+    use_amp = args.amp and device.type == "cuda"
+
+    # step 1: load manifest
+    print(f"[1] loading Lance manifest from {args.lance_uri}")
+    manifest = load_manifest_from_lance(args.lance_uri, args.datasets, args.s3_endpoint)
+    n_tars = len(manifest)
+    n_members = sum(len(v) for v in manifest.values())
+    n_videos = sum(1 for members in manifest.values()
+                   for mp, _, _ in members
+                   if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS)
+    print(f"    {n_tars} tars, {n_members:,} members, ~{n_videos:,} videos")
+
+    # step 2: warmup — discover head specs from a small sample
+    print(f"[2] warmup: encoding {args.warmup_frames} frames to discover token types")
+    t0 = time.monotonic()
+    head_specs, value_limit, warmup_traces = warmup_discover_specs(
+        manifest, args.warmup_frames, args.s3_bucket, args.s3_endpoint,
+        args.width, args.height, args.frames_per_video, args.fps,
+        args.qp, args.max_cu_size)
+    id_to_type = list(head_specs.keys())
+    type_to_id = {name: idx for idx, name in enumerate(id_to_type)}
+    pad_type_id = len(id_to_type)
+    value_vocab_size = value_limit * 2 + 3
+    bos_value_id = value_vocab_size - 1
+    print(f"    {len(head_specs)} token types, value_limit={value_limit} in {time.monotonic() - t0:.1f}s")
+    for name, spec in head_specs.items():
+        print(f"      {name:<32} {spec.family:<12} out={spec.out_dim} learn={spec.learn}")
+
+    # step 3: build eval pool from held-out videos
+    print(f"[3] building eval pool: {args.eval_videos} videos")
+    eval_bundle = build_eval_pool(
+        manifest, args.eval_videos, type_to_id, head_specs, value_limit,
+        args.s3_bucket, args.s3_endpoint, args.width, args.height,
+        args.frames_per_video, args.fps, args.qp, args.max_cu_size, args.seed)
+    print(f"    {eval_bundle.total_tokens:,} eval tokens")
+
+    uniform_bpt = compute_uniform_bpt(eval_bundle.val)
+    unigram_bpt = compute_unigram_bpt(eval_bundle.train, eval_bundle.val, id_to_type)
+
+    # step 4: build model
+    model_config = ModelConfig(
+        block_size=args.block_size, n_layer=args.n_layer, n_head=args.n_head,
+        n_embd=args.n_embd, dropout=args.dropout,
+        type_vocab_size=pad_type_id + 1, value_vocab_size=value_vocab_size)
+    model = CTPModel(model_config, head_specs, type_to_id).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay,
+        betas=(0.9, 0.95))
+
+    def lr_lambda(step):
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return float(step) / float(max(1, args.warmup_steps))
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    n_params = sum(p.numel() for p in model.parameters())
+
+    # step 5: build streaming DataLoader
+    stream_dataset = CTPStreamDataset(
+        manifest, args.s3_bucket, args.s3_endpoint,
+        args.width, args.height, args.frames_per_video, args.fps,
+        args.qp, args.max_cu_size, args.block_size,
+        type_to_id, head_specs, value_limit, seed=args.seed)
+    loader = torch.utils.data.DataLoader(
+        stream_dataset, batch_size=args.batch_size,
+        num_workers=args.streaming_workers, pin_memory=True,
+        persistent_workers=args.streaming_workers > 0,
+        prefetch_factor=4 if args.streaming_workers > 0 else None)
+
+    print("=" * 72)
+    print("ctp streaming trainer")
+    print("=" * 72)
+    print(f"source            : lance:{','.join(args.datasets)} (~{n_videos:,} videos)")
+    print(f"device            : {device}")
+    print(f"model params      : {n_params:,}")
+    print(f"amp               : {'bf16' if use_amp else 'off'}")
+    print(f"warmup            : {args.warmup_steps} steps")
+    print(f"streaming workers : {args.streaming_workers}")
+    print(f"\nbaselines (eval pool)")
+    print(f"{'uniform':<16} {uniform_bpt:>8.3f} bpt")
+    print(f"{'unigram':<16} {unigram_bpt:>8.3f} bpt")
+
+    if wandb_run:
+        wandb_run.summary["uniform_bpt"] = uniform_bpt
+        wandb_run.summary["unigram_bpt"] = unigram_bpt
+        wandb_run.summary["n_params"] = n_params
+        wandb_run.summary["n_videos_total"] = n_videos
+        wandb_run.summary["streaming"] = True
+
+    # step 6: train
+    print(f"\ntraining ({args.max_iters} iters, bs={args.batch_size}, ctx={args.block_size})")
+    data_iter = iter(loader)
+    best_val = float("inf")
+    t_start = time.monotonic()
+
+    for step in range(args.max_iters + 1):
+        if step % args.eval_interval == 0 or step == args.max_iters:
+            metrics = estimate_loss(
+                model, eval_bundle, args.batch_size,
+                args.block_size, args.eval_iters, device)
+            best_val = min(best_val, metrics["val"])
+            elapsed = time.monotonic() - t_start
+            print(f"step {step:>5d} | train {metrics['train']:.3f} bpt | val {metrics['val']:.3f} bpt | {elapsed:.0f}s")
+            if wandb_run:
+                wandb_run.log({"step": step, "train/bpt": metrics["train"],
+                               "val/bpt": metrics["val"], "val/best_bpt": best_val})
+
+        if step == args.max_iters:
+            break
+
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            loss, train_bpt = model(batch)
+        scaler.scale(loss).backward()
+        if args.max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        if wandb_run and step % 10 == 0:
+            wandb_run.log({"step": step, "train/loss": loss.item(),
+                           "train/bpt_step": train_bpt, "lr": scheduler.get_last_lr()[0]})
+
+    print(f"\n{'model':<18} {'BPT':>7}  {'vs uniform':>10}")
+    print(f"{'─' * 38}")
+    print(f"{'uniform':<18} {uniform_bpt:>7.3f}  {'baseline':>10}")
+    print(f"{'unigram':<18} {unigram_bpt:>7.3f}  {(1 - unigram_bpt / uniform_bpt) * 100:>9.1f}%")
+    print(f"{'CTPModel':<18} {best_val:>7.3f}  {(1 - best_val / uniform_bpt) * 100:>9.1f}%")
+    print(f"{'─' * 38}")
+    print(f"{n_params:,} params | streaming from ~{n_videos:,} howto100m videos")
+
+    if wandb_run:
+        wandb_run.summary["best_val_bpt"] = best_val
+        wandb_run.finish()
+
+
 # -- main ---------------------------------------------------------------------
 
 
@@ -767,7 +1152,13 @@ def main():
             config=vars(args),
         )
 
-    # -- step 1: load frames --
+    # -- streaming mode --
+    if args.streaming:
+        assert args.lance_uri, "--lance-uri required for --streaming"
+        _run_streaming(args, device, wandb_run)
+        return
+
+    # -- batch mode: step 1 load frames --
     if args.lance_uri:
         print(f"[1] loading Lance manifest from {args.lance_uri}")
         print(f"    datasets={args.datasets}")
