@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--height", type=int, default=64)
     p.add_argument("--frames-per-video", type=int, default=8)
+    p.add_argument("--num-gops", type=int, default=0,
+                   help="GOP-aligned extraction: sample N I-frames + their P/B frames. "
+                        "0=disabled (use --frames-per-video instead)")
+    p.add_argument("--pframes-per-gop", type=int, default=7,
+                   help="P/B frames to include per GOP (with --num-gops)")
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--qp", type=int, default=27)
     p.add_argument("--max-cu-size", type=int, default=8)
@@ -422,20 +427,85 @@ def _mv_to_bin(val):
     return max(0, min(_MV_BINS - 1, b))
 
 
+def _extract_mv_data(frame):
+    """Extract MV fields into plain tuples so the av.Frame can be freed."""
+    mb_mvs = {}
+    for sd in frame.side_data:
+        if "MOTION" not in str(sd.type).upper():
+            continue
+        for mv in sd:
+            key = (mv.dst_x // 16, mv.dst_y // 16)
+            mb_mvs.setdefault(key, []).append(
+                (mv.motion_x, mv.motion_y, mv.w, mv.h, mv.dst_y, mv.dst_x))
+        break
+    return mb_mvs
+
+
+def _build_frame_trace(poc, frame_type_val, mb_mvs, w, h):
+    """Build SymbolTrace list for one frame from pre-extracted MV data."""
+    mb_w = (w + 15) // 16
+    mb_h = (h + 15) // 16
+
+    trace = [SymbolTrace(
+        poc=poc, cu_x=0, cu_y=0, cu_size=16,
+        plane="Y", token_type="frame_type", value=frame_type_val, vocab_size=3)]
+
+    for mby in range(mb_h):
+        for mbx in range(mb_w):
+            x, y = mbx * 16, mby * 16
+            mv_list = mb_mvs.get((mbx, mby), [])
+
+            if frame_type_val == 0:
+                mode = 0
+            elif mv_list:
+                mode = 1
+            else:
+                mode = 2
+
+            trace.append(SymbolTrace(
+                poc=poc, cu_x=x, cu_y=y, cu_size=16,
+                plane="Y", token_type="mb_mode", value=mode, vocab_size=3))
+
+            if mode != 1 or not mv_list:
+                continue
+
+            widths = {mv[2] for mv in mv_list}
+            heights = {mv[3] for mv in mv_list}
+            n_mvs = len(mv_list)
+            if n_mvs >= 4 or (8 in widths and 8 in heights):
+                part = 3
+            elif 8 in heights and 16 in widths:
+                part = 1
+            elif 8 in widths and 16 in heights:
+                part = 2
+            else:
+                part = 0
+
+            trace.append(SymbolTrace(
+                poc=poc, cu_x=x, cu_y=y, cu_size=16,
+                plane="Y", token_type="partition_mode", value=part, vocab_size=4))
+
+            sorted_mvs = sorted(mv_list, key=lambda m: (m[4], m[5]))
+            max_mvs = [1, 2, 2, 4][part]
+            for mv in sorted_mvs[:max_mvs]:
+                trace.append(SymbolTrace(
+                    poc=poc, cu_x=x, cu_y=y, cu_size=16,
+                    plane="Y", token_type="mv_x",
+                    value=_mv_to_bin(mv[0]), vocab_size=_MV_BINS))
+                trace.append(SymbolTrace(
+                    poc=poc, cu_x=x, cu_y=y, cu_size=16,
+                    plane="Y", token_type="mv_y",
+                    value=_mv_to_bin(mv[1]), vocab_size=_MV_BINS))
+
+    return trace
+
+
+_PTYPE_NAMES = {1: "I", 2: "P", 3: "B"}
+_PTYPE_MAP = {"I": 0, "P": 1, "B": 2}
+
+
 def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
-    """Extract codec tokens directly from MPEG-4/VP8 video bytes via PyAV.
-
-    Uses FFmpeg's motion vector export to get per-macroblock codec decisions.
-    ~50ms/video vs ~16s for HEVC re-encode.
-
-    Token vocabulary:
-      frame_type     - I/P/B (vocab=3), 1 per frame
-      mb_mode        - intra=0, inter=1, skip=2 (vocab=3), 1 per MB
-      partition_mode - 16x16=0, 16x8=1, 8x16=2, 8x8=3 (vocab=4), inter MBs only
-      mv_x, mv_y    - nonlinear 256-bin discretized (vocab=256), per sub-partition
-
-    Per-MB token order: mb_mode -> [partition_mode -> mv_x -> mv_y ...]
-    Skip/intra MBs: mb_mode only (variable-length, no padding).
+    """Extract codec tokens from evenly-spaced frames via PyAV MV export.
 
     Returns list[list[SymbolTrace]], one trace per frame.
     """
@@ -444,107 +514,287 @@ def extract_mpeg4_traces_from_bytes(raw_bytes, num_frames, fps=8):
     container = av.open(io.BytesIO(raw_bytes))
     stream = container.streams.video[0]
     stream.codec_context.options = {"flags2": "+export_mvs"}
+    stream.thread_type = "AUTO"
 
     total = stream.frames or 0
     video_fps = float(stream.average_rate or 30)
 
-    decoded = []
-    ptype_names = {1: "I", 2: "P", 3: "B"}
+    if total > 0:
+        target_indices = _pick_indices(total, video_fps, num_frames, fps)
+        target_set = frozenset(target_indices)
+        stop_after = max(target_indices)
+    else:
+        target_indices = None
+        target_set = None
+        stop_after = float("inf")
+
+    collected = {}
+    frame_idx = 0
     for frame in container.decode(video=0):
-        ptype = ptype_names.get(int(frame.pict_type), "I")
-        mvs = None
-        for sd in frame.side_data:
-            if "MOTION" in str(sd.type).upper():
-                mvs = sd
-                break
-        w, h = frame.width, frame.height
-        decoded.append((ptype, mvs, w, h))
+        if target_set is None or frame_idx in target_set:
+            ptype = _PTYPE_NAMES.get(int(frame.pict_type), "I")
+            collected[frame_idx] = (ptype, _extract_mv_data(frame),
+                                    frame.width, frame.height)
+        frame_idx += 1
+        if frame_idx > stop_after:
+            break
     container.close()
 
-    if not decoded:
+    if not collected:
         return None
-    if not total:
-        total = len(decoded)
-
-    indices = _pick_indices(total, video_fps, num_frames, fps)
-    ptype_map = {"I": 0, "P": 1, "B": 2}
+    actual_total = total or frame_idx
+    if target_indices is None:
+        target_indices = _pick_indices(actual_total, video_fps, num_frames, fps)
 
     all_traces = []
-    for poc_out, idx in enumerate(indices):
-        if idx >= len(decoded):
-            idx = len(decoded) - 1
-        ptype, mvs, w, h = decoded[idx]
-        frame_type_val = ptype_map.get(ptype, 0)
-        mb_w = (w + 15) // 16
-        mb_h = (h + 15) // 16
-
-        # collect ALL MVs per MB (not just the first)
-        from collections import defaultdict
-        mb_mvs = defaultdict(list)
-        if mvs is not None:
-            for mv in mvs:
-                mbx = mv.dst_x // 16
-                mby = mv.dst_y // 16
-                mb_mvs[(mbx, mby)].append(mv)
-
-        trace = []
-        trace.append(SymbolTrace(
-            poc=poc_out, cu_x=0, cu_y=0, cu_size=16,
-            plane="Y", token_type="frame_type", value=frame_type_val, vocab_size=3))
-
-        for mby in range(mb_h):
-            for mbx in range(mb_w):
-                x, y = mbx * 16, mby * 16
-                mv_list = mb_mvs.get((mbx, mby), [])
-
-                if frame_type_val == 0:
-                    mode = 0  # intra (I-frame)
-                elif mv_list:
-                    mode = 1  # inter
-                else:
-                    mode = 2  # skip
-
-                trace.append(SymbolTrace(
-                    poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                    plane="Y", token_type="mb_mode", value=mode, vocab_size=3))
-
-                if mode != 1 or not mv_list:
-                    continue
-
-                # infer partition mode from MV block sizes
-                widths = {mv.w for mv in mv_list}
-                heights = {mv.h for mv in mv_list}
-                n_mvs = len(mv_list)
-                if n_mvs >= 4 or (8 in widths and 8 in heights):
-                    part = 3  # 8x8
-                elif 8 in heights and 16 in widths:
-                    part = 1  # 16x8
-                elif 8 in widths and 16 in heights:
-                    part = 2  # 8x16
-                else:
-                    part = 0  # 16x16
-
-                trace.append(SymbolTrace(
-                    poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                    plane="Y", token_type="partition_mode", value=part, vocab_size=4))
-
-                # emit MV pairs for each sub-partition
-                # sort by position (top-left first) for consistent ordering
-                sorted_mvs = sorted(mv_list, key=lambda m: (m.dst_y, m.dst_x))
-                # cap at expected count for this partition mode
-                max_mvs = [1, 2, 2, 4][part]
-                for mv in sorted_mvs[:max_mvs]:
-                    trace.append(SymbolTrace(
-                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                        plane="Y", token_type="mv_x",
-                        value=_mv_to_bin(mv.motion_x), vocab_size=_MV_BINS))
-                    trace.append(SymbolTrace(
-                        poc=poc_out, cu_x=x, cu_y=y, cu_size=16,
-                        plane="Y", token_type="mv_y",
-                        value=_mv_to_bin(mv.motion_y), vocab_size=_MV_BINS))
-
-        all_traces.append(trace)
+    for poc, idx in enumerate(target_indices):
+        idx = min(idx, actual_total - 1)
+        if idx not in collected:
+            idx = min(collected, key=lambda k: abs(k - idx))
+        ptype, mb_mvs, w, h = collected[idx]
+        all_traces.append(_build_frame_trace(poc, _PTYPE_MAP.get(ptype, 0), mb_mvs, w, h))
     return all_traces
+
+
+def _decode_gops(raw_bytes, num_gops=8, pframes_per_gop=7):
+    """Seek-based GOP decode: demux scan for keyframes, then seek+decode each GOP.
+
+    Returns list of (ptype_str, mb_mvs_dict, w, h) tuples, or None.
+    For a 5000-frame video with 8 GOPs of 8 frames each, this decodes ~64 frames
+    instead of ~5000 (the old linear-scan approach).
+    """
+    import av
+
+    buf = io.BytesIO(raw_bytes)
+
+    # pass 1: lightweight demux scan for keyframe PTS (~1ms, no decode)
+    container = av.open(buf)
+    stream = container.streams.video[0]
+    iframe_info = []
+    total = 0
+    for packet in container.demux(stream):
+        if packet.size == 0:
+            continue
+        if packet.is_keyframe:
+            pts = packet.pts if packet.pts is not None else packet.dts
+            if pts is not None:
+                iframe_info.append((total, pts))
+        total += 1
+    container.close()
+
+    if not iframe_info or total < 2:
+        return None
+
+    # select evenly-spaced GOPs
+    n = len(iframe_info)
+    if n <= num_gops:
+        selected = list(range(n))
+    else:
+        step = n / num_gops
+        selected = [int(i * step) for i in range(num_gops)]
+
+    # build per-GOP decode plan: (seek_pts, max_frames_to_decode)
+    gop_plan = []
+    for gi in selected:
+        _, pts = iframe_info[gi]
+        next_gi = gi + 1
+        if next_gi < n:
+            gop_len = min(iframe_info[next_gi][0] - iframe_info[gi][0],
+                          1 + pframes_per_gop)
+        else:
+            gop_len = 1 + pframes_per_gop
+        gop_plan.append((pts, gop_len))
+
+    # pass 2: seek to each GOP's keyframe and decode only needed frames
+    buf.seek(0)
+    container = av.open(buf)
+    stream = container.streams.video[0]
+    stream.codec_context.options = {"flags2": "+export_mvs"}
+    stream.thread_type = "AUTO"
+
+    frames_data = []
+    for seek_pts, n_frames in gop_plan:
+        container.seek(seek_pts, stream=stream)
+        decoded = 0
+        for frame in container.decode(video=0):
+            # skip pre-seek frames (B-frame reordering)
+            if frame.pts is not None and frame.pts < seek_pts:
+                continue
+            if decoded >= n_frames:
+                break
+            ptype = _PTYPE_NAMES.get(int(frame.pict_type), "I")
+            frames_data.append((ptype, _extract_mv_data(frame),
+                                frame.width, frame.height))
+            decoded += 1
+    container.close()
+
+    return frames_data if frames_data else None
+
+
+def extract_mpeg4_gops_from_bytes(raw_bytes, num_gops=8, pframes_per_gop=7):
+    """GOP extraction -> list[list[SymbolTrace]]."""
+    frames_data = _decode_gops(raw_bytes, num_gops, pframes_per_gop)
+    if not frames_data:
+        return None
+    return [_build_frame_trace(poc, _PTYPE_MAP.get(pt, 0), mv, w, h)
+            for poc, (pt, mv, w, h) in enumerate(frames_data)]
+
+
+# -- MPEG-4 direct-to-tensor path (bypasses SymbolTrace, ~20x less memory) ----
+# constants initialized lazily after HeadSpec is defined (see _init_mpeg4_constants)
+
+_MPEG4_HEAD_SPECS = None
+_MPEG4_ID_TO_TYPE = None
+_MPEG4_TYPE_TO_ID = None
+_MPEG4_VALUE_LIMIT = 255
+_MPEG4_VALUE_VOCAB = _MPEG4_VALUE_LIMIT * 2 + 3
+_MPEG4_BOS_VALUE_ID = _MPEG4_VALUE_VOCAB - 1
+_MPEG4_PAD_TYPE_ID = None
+
+
+def _init_mpeg4_constants():
+    global _MPEG4_HEAD_SPECS, _MPEG4_ID_TO_TYPE, _MPEG4_TYPE_TO_ID, _MPEG4_PAD_TYPE_ID
+    if _MPEG4_HEAD_SPECS is not None:
+        return
+    _MPEG4_HEAD_SPECS = {
+        "frame_type": HeadSpec(family="categorical", out_dim=3, learn=True),
+        "mb_mode": HeadSpec(family="categorical", out_dim=3, learn=True),
+        "mv_x": HeadSpec(family="categorical", out_dim=_MV_BINS, learn=True),
+        "mv_y": HeadSpec(family="categorical", out_dim=_MV_BINS, learn=True),
+        "partition_mode": HeadSpec(family="categorical", out_dim=4, learn=True),
+    }
+    _MPEG4_ID_TO_TYPE = list(sorted(_MPEG4_HEAD_SPECS.keys()))
+    _MPEG4_TYPE_TO_ID = {name: idx for idx, name in enumerate(_MPEG4_ID_TO_TYPE)}
+    _MPEG4_PAD_TYPE_ID = len(_MPEG4_ID_TO_TYPE)
+
+
+def _tensorize_mpeg4_frame(poc, frame_type_val, mb_mvs, w, h, max_poc):
+    """Build TensorTrace directly from MV data. No SymbolTrace intermediary."""
+    _init_mpeg4_constants()
+    tid_ft = _MPEG4_TYPE_TO_ID["frame_type"]
+    tid_mb = _MPEG4_TYPE_TO_ID["mb_mode"]
+    tid_pm = _MPEG4_TYPE_TO_ID["partition_mode"]
+    tid_mx = _MPEG4_TYPE_TO_ID["mv_x"]
+    tid_my = _MPEG4_TYPE_TO_ID["mv_y"]
+    vl = _MPEG4_VALUE_LIMIT
+
+    mb_w = (w + 15) // 16
+    mb_h = (h + 15) // 16
+
+    # pre-allocate to upper bound: 1 + 10 * mb_count
+    max_n = 1 + 10 * mb_w * mb_h
+    type_ids = np.empty(max_n, dtype=np.int64)
+    targets = np.empty(max_n, dtype=np.int64)
+    vocab_sizes = np.empty(max_n, dtype=np.int64)
+    cx = np.empty(max_n, dtype=np.float32)
+    cy = np.empty(max_n, dtype=np.float32)
+
+    idx = 0
+    type_ids[idx] = tid_ft
+    targets[idx] = frame_type_val
+    vocab_sizes[idx] = 3
+    cx[idx] = 0.0
+    cy[idx] = 0.0
+    idx += 1
+
+    inv_w = 1.0 / max(w, 1)
+    inv_h = 1.0 / max(h, 1)
+
+    for mby in range(mb_h):
+        for mbx in range(mb_w):
+            x = mbx * 16
+            y = mby * 16
+            mv_list = mb_mvs.get((mbx, mby), [])
+
+            if frame_type_val == 0:
+                mode = 0
+            elif mv_list:
+                mode = 1
+            else:
+                mode = 2
+
+            type_ids[idx] = tid_mb
+            targets[idx] = mode
+            vocab_sizes[idx] = 3
+            cx[idx] = x * inv_w
+            cy[idx] = y * inv_h
+            idx += 1
+
+            if mode != 1 or not mv_list:
+                continue
+
+            widths = {mv[2] for mv in mv_list}
+            heights = {mv[3] for mv in mv_list}
+            n_mvs = len(mv_list)
+            if n_mvs >= 4 or (8 in widths and 8 in heights):
+                part = 3
+            elif 8 in heights and 16 in widths:
+                part = 1
+            elif 8 in widths and 16 in heights:
+                part = 2
+            else:
+                part = 0
+
+            type_ids[idx] = tid_pm
+            targets[idx] = part
+            vocab_sizes[idx] = 4
+            cx[idx] = x * inv_w
+            cy[idx] = y * inv_h
+            idx += 1
+
+            sorted_mvs = sorted(mv_list, key=lambda m: (m[4], m[5]))
+            max_mv_count = (1, 2, 2, 4)[part]
+            for mv in sorted_mvs[:max_mv_count]:
+                fx = x * inv_w
+                fy = y * inv_h
+                type_ids[idx] = tid_mx
+                targets[idx] = _mv_to_bin(mv[0])
+                vocab_sizes[idx] = _MV_BINS
+                cx[idx] = fx
+                cy[idx] = fy
+                idx += 1
+
+                type_ids[idx] = tid_my
+                targets[idx] = _mv_to_bin(mv[1])
+                vocab_sizes[idx] = _MV_BINS
+                cx[idx] = fx
+                cy[idx] = fy
+                idx += 1
+
+    n = idx
+    type_ids_t = torch.from_numpy(type_ids[:n].copy())
+    targets_t = torch.from_numpy(targets[:n].copy())
+    vocab_sizes_t = torch.from_numpy(vocab_sizes[:n].copy())
+
+    prev_value_ids = torch.full((n,), _MPEG4_BOS_VALUE_ID, dtype=torch.long)
+    if n > 1:
+        pv = np.clip(targets[:n - 1] + vl, 0, _MPEG4_VALUE_VOCAB - 2)
+        prev_value_ids[1:] = torch.from_numpy(pv.astype(np.int64))
+
+    aux = torch.zeros(n, 5, dtype=torch.float32)
+    aux[:, 0] = poc / max(max_poc, 1)
+    aux[:, 1] = torch.from_numpy(cx[:n])
+    aux[:, 2] = torch.from_numpy(cy[:n])
+    aux[:, 3] = 1.0  # cu_size/max_cu_size = 16/16
+
+    is_iframe = frame_type_val == 0
+    learn_mask = torch.zeros(n, dtype=torch.bool) if is_iframe else torch.ones(n, dtype=torch.bool)
+
+    return TensorTrace(
+        type_ids=type_ids_t, prev_value_ids=prev_value_ids,
+        targets=targets_t, vocab_sizes=vocab_sizes_t,
+        aux=aux, learn_mask=learn_mask,
+    )
+
+
+def extract_mpeg4_gops_to_tensors(raw_bytes, num_gops=8, pframes_per_gop=7):
+    """GOP extraction -> list[TensorTrace]. No SymbolTrace intermediary (~20x less memory)."""
+    frames_data = _decode_gops(raw_bytes, num_gops, pframes_per_gop)
+    if not frames_data:
+        return None
+    max_poc = max(1, len(frames_data) - 1)
+    return [_tensorize_mpeg4_frame(poc, _PTYPE_MAP.get(pt, 0), mv, w, h, max_poc)
+            for poc, (pt, mv, w, h) in enumerate(frames_data)]
 
 
 def extract_mpeg4_traces_from_video(video_path, num_frames, fps=8):
@@ -701,8 +951,12 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
             ],
             dtype=torch.float32,
         )
+        # I-frame tokens are context only (no loss) — predict P/B frame tokens
+        is_iframe = (trace[0].token_type == "frame_type"
+                     and trace[0].value == 0) if trace else False
         learn_mask = torch.tensor(
-            [head_specs[t.token_type].learn for t in trace], dtype=torch.bool
+            [False if is_iframe else head_specs[t.token_type].learn
+             for t in trace], dtype=torch.bool
         )
         tensor_traces.append(
             TensorTrace(
@@ -741,6 +995,36 @@ def build_dataset(traces, width, height, val_fraction, seed, source):
     )
 
 
+def build_dataset_from_tensors(tensor_traces, val_fraction, seed, source):
+    """Build DatasetBundle from pre-tensorized MPEG-4 traces (no SymbolTrace scan)."""
+    _init_mpeg4_constants()
+    head_specs = _MPEG4_HEAD_SPECS
+    id_to_type = _MPEG4_ID_TO_TYPE
+    type_to_id = _MPEG4_TYPE_TO_ID
+    pad_type_id = _MPEG4_PAD_TYPE_ID
+
+    rng = random.Random(seed)
+    rng.shuffle(tensor_traces)
+
+    if len(tensor_traces) == 1:
+        train = val = tensor_traces
+    else:
+        split = int(round(len(tensor_traces) * (1.0 - val_fraction)))
+        split = min(max(split, 1), len(tensor_traces) - 1)
+        train, val = tensor_traces[:split], tensor_traces[split:]
+
+    total_tokens = sum(t.length() for t in tensor_traces)
+    return DatasetBundle(
+        train=train, val=val,
+        type_to_id=type_to_id, id_to_type=id_to_type,
+        head_specs=head_specs, pad_type_id=pad_type_id,
+        bos_value_id=_MPEG4_BOS_VALUE_ID,
+        value_vocab_size=_MPEG4_VALUE_VOCAB,
+        value_limit=_MPEG4_VALUE_LIMIT,
+        source=source, total_tokens=total_tokens,
+    )
+
+
 # -- streaming dataset --------------------------------------------------------
 
 
@@ -762,6 +1046,10 @@ def tensorize_trace(trace, type_to_id, head_specs, value_limit, width, height):
     aux = torch.zeros(n, 5, dtype=torch.float32)
     learn_mask = torch.zeros(n, dtype=torch.bool)
 
+    # I-frame tokens are context only (no loss)
+    is_iframe = (trace[0].token_type == "frame_type"
+                 and trace[0].value == 0) if trace else False
+
     for i, t in enumerate(trace):
         tid = type_to_id.get(t.token_type, -1)
         if tid < 0:
@@ -775,7 +1063,8 @@ def tensorize_trace(trace, type_to_id, head_specs, value_limit, width, height):
             t.poc / max_poc, t.cu_x / max(width, 1), t.cu_y / max(height, 1),
             t.cu_size / max_cu_size, PLANE_TO_ID.get(t.plane, 0) / 2.0,
         ])
-        learn_mask[i] = head_specs[t.token_type].learn if t.token_type in head_specs else False
+        if not is_iframe:
+            learn_mask[i] = head_specs[t.token_type].learn if t.token_type in head_specs else False
 
     return type_ids, prev_value_ids, targets, vocab_sizes, aux, learn_mask
 
@@ -1447,6 +1736,7 @@ def main():
     # -- batch mode: step 1+2 load data and extract traces --
     frames = None
     traces = []
+    tensor_traces = None  # set when using direct-to-tensor path
 
     if args.lance_uri and args.codec_mode == "mpeg4":
         # fast path: fetch raw bytes -> extract MPEG-4 traces directly (no pixel decode)
@@ -1469,7 +1759,10 @@ def main():
                          if os.path.splitext(mp)[1].lower() in _VIDEO_EXTS]
         random.shuffle(video_members)
 
-        print(f"[2] extracting MPEG-4 traces from {args.num_videos} videos (16 threads)")
+        use_gops = args.num_gops > 0
+        mode_desc = (f"{args.num_gops} GOPs/video ({args.pframes_per_gop} P/B each)"
+                     if use_gops else f"{args.frames_per_video} frames/video")
+        print(f"[2] extracting MPEG-4 traces from {args.num_videos} videos ({mode_desc}, 16 threads)")
         t0 = time.monotonic()
         n_ok = n_fail = 0
         selected = video_members[:args.num_videos]
@@ -1480,17 +1773,28 @@ def main():
                 resp = client.get_object(Bucket=args.s3_bucket, Key=tk,
                                          Range=f"bytes={off}-{off + sz - 1}")
                 raw = resp["Body"].read()
-                return extract_mpeg4_traces_from_bytes(raw, args.frames_per_video, args.fps)
+                if use_gops:
+                    # direct-to-tensor: skip SymbolTrace entirely (~20x less memory)
+                    return ("tensor", extract_mpeg4_gops_to_tensors(
+                        raw, args.num_gops, args.pframes_per_gop))
+                return ("trace", extract_mpeg4_traces_from_bytes(
+                    raw, args.frames_per_video, args.fps))
             except Exception:
                 return None
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        if use_gops:
+            tensor_traces = []
         with ThreadPoolExecutor(max_workers=16) as pool:
             futs = {pool.submit(_fetch_and_extract, item): item for item in selected}
             for fut in as_completed(futs):
                 result = fut.result()
-                if result:
-                    traces.extend(result)
+                if result and result[1]:
+                    tag, data = result
+                    if tag == "tensor":
+                        tensor_traces.extend(data)
+                    else:
+                        traces.extend(data)
                     n_ok += 1
                 else:
                     n_fail += 1
@@ -1518,14 +1822,25 @@ def main():
 
     else:
         # local file
-        print(f"[1] loading {args.frames_per_video} frames from {args.video}")
         source_label = args.video.name
         if args.codec_mode == "mpeg4":
-            print(f"[2] extracting MPEG-4 traces")
-            t0 = time.monotonic()
-            traces = extract_mpeg4_traces_from_video(args.video, args.frames_per_video, args.fps)
-            if traces is None:
-                traces = []
+            if args.num_gops > 0:
+                print(f"[1] extracting {args.num_gops} GOPs from {args.video}")
+                t0 = time.monotonic()
+                with open(str(args.video), "rb") as f:
+                    raw = f.read()
+                traces = extract_mpeg4_gops_from_bytes(
+                    raw, args.num_gops, args.pframes_per_gop)
+                if traces is None:
+                    traces = []
+            else:
+                print(f"[1] loading {args.frames_per_video} frames from {args.video}")
+                print(f"[2] extracting MPEG-4 traces")
+                t0 = time.monotonic()
+                traces = extract_mpeg4_traces_from_video(
+                    args.video, args.frames_per_video, args.fps)
+                if traces is None:
+                    traces = []
             encode_time = time.monotonic() - t0
         else:
             frames = load_video_frames(
@@ -1535,14 +1850,22 @@ def main():
             t0 = time.monotonic()
             traces = encode_symbol_traces(frames, args.qp, args.max_cu_size, args.frames_per_video)
             encode_time = time.monotonic() - t0
-    total_tokens = sum(len(tr) for tr in traces)
-    print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")
+    if tensor_traces:
+        total_tokens = sum(t.length() for t in tensor_traces)
+        print(f"    {len(tensor_traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s (direct tensor)")
+    else:
+        total_tokens = sum(len(tr) for tr in traces)
+        print(f"    {len(traces)} traces, {total_tokens:,} tokens in {encode_time:.1f}s")
 
     # -- step 3: build dataset --
     print("[3] building train/val split")
-    dataset = build_dataset(
-        traces, args.width, args.height, args.val_fraction, args.seed, source_label
-    )
+    if tensor_traces:
+        dataset = build_dataset_from_tensors(
+            tensor_traces, args.val_fraction, args.seed, source_label)
+    else:
+        dataset = build_dataset(
+            traces, args.width, args.height, args.val_fraction, args.seed, source_label
+        )
 
     model_config = ModelConfig(
         block_size=args.block_size,

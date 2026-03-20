@@ -3,9 +3,10 @@
 #SBATCH --partition=main
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=0
+#SBATCH --exclusive
 #SBATCH --time=06:00:00
 #SBATCH --output=/home/brian/logs/slurm/ctp-2k-%j.out
 #SBATCH --error=/home/brian/logs/slurm/ctp-2k-%j.err
@@ -28,26 +29,22 @@ export WANDB_DIR="/tmp/wandb"
 mkdir -p "${WANDB_DIR}"
 export PYTHONUNBUFFERED=1
 
-echo "=== CTP scale: 2000 videos, 128M params, batch MPEG-4 ==="
+echo "=== CTP GOP: 2000 videos, 8 GOPs × 8 frames, 128M params ==="
 echo "node: $(hostname)"
 echo "gpu:  $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 echo "started: $(date -Iseconds)"
 
-# 2000 videos x 8 frames = 16000 frames -> ~24M tokens
-# 16-thread parallel S3 fetch: ~3 min (vs ~47 min sequential)
+# 2000 videos x 8 GOPs x (1 I + 7 P/B) = ~128K frames
+# I-frame tokens = context (no loss), P/B tokens = prediction targets
 # model: 12L x 12H x 768d ≈ 128M params
-# training: 10000 iters, bf16 AMP
 python examples/ctp_demo.py \
     --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_video_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
     --num-videos 2000 \
-    --frames-per-video 8 \
-    --width 128 \
-    --height 64 \
-    --qp 27 \
-    --max-cu-size 8 \
+    --num-gops 8 \
+    --pframes-per-gop 7 \
     --n-layer 12 \
     --n-head 12 \
     --n-embd 768 \
@@ -63,6 +60,6 @@ python examples/ctp_demo.py \
     --device cuda \
     --wandb \
     --wandb-project nano-hevc-ctp \
-    --wandb-run-name "ctp-2kv-12L768d-mpeg4"
+    --wandb-run-name "ctp-2kv-8gop-12L768d"
 
 echo "finished: $(date -Iseconds)"
