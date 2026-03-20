@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
                    help="linear LR warmup steps (0=disabled)")
     p.add_argument("--max-grad-norm", type=float, default=0.0,
                    help="gradient clipping norm (0=disabled)")
+    p.add_argument("--lr-decay", choices=["none", "cosine"], default="none",
+                   help="LR schedule after warmup: none=constant, cosine=decay to 0")
     p.add_argument("--amp", action="store_true",
                    help="use bf16 automatic mixed precision")
 
@@ -1607,6 +1609,10 @@ def _run_streaming(args, device, wandb_run):
     def lr_lambda(step):
         if args.warmup_steps > 0 and step < args.warmup_steps:
             return float(step) / float(max(1, args.warmup_steps))
+        if args.lr_decay == "cosine":
+            decay_steps = max(1, args.max_iters - args.warmup_steps)
+            progress = (step - args.warmup_steps) / decay_steps
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -1636,6 +1642,7 @@ def _run_streaming(args, device, wandb_run):
     print(f"model params      : {n_params:,}")
     print(f"amp               : {'bf16' if use_amp else 'off'}")
     print(f"warmup            : {args.warmup_steps} steps")
+    print(f"lr decay          : {args.lr_decay}")
     print(f"streaming workers : {args.streaming_workers}")
     print(f"\nbaselines (eval pool)")
     print(f"{'uniform':<16} {uniform_bpt:>8.3f} bpt")
@@ -1886,6 +1893,10 @@ def main():
     def lr_lambda(step):
         if args.warmup_steps > 0 and step < args.warmup_steps:
             return float(step) / float(max(1, args.warmup_steps))
+        if args.lr_decay == "cosine":
+            decay_steps = max(1, args.max_iters - args.warmup_steps)
+            progress = (step - args.warmup_steps) / decay_steps
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -1913,6 +1924,7 @@ def main():
     print(f"head specs        : {len(dataset.head_specs)} types")
     print(f"amp               : {'bf16' if use_amp else 'off'}")
     print(f"warmup            : {args.warmup_steps} steps")
+    print(f"lr decay          : {args.lr_decay}")
     print(f"grad clip         : {args.max_grad_norm or 'off'}")
     print(f"\nbaselines")
     print(f"{'uniform':<16} {uniform_bpt:>8.3f} bpt")
