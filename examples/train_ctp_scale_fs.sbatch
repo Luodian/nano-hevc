@@ -21,8 +21,8 @@ pip install av -e . --quiet 2>&1 | tail -1
 export S3_ENDPOINT_URL="https://storage.eu-north1.nebius.cloud"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials"
 export AWS_CONFIG_FILE="$HOME/.aws/config"
-if [ -z "${WANDB_API_KEY:-}" ] && [ -f /home/brian/.wandb_api_key ]; then
-    export WANDB_API_KEY="$(tr -d '\n' < /home/brian/.wandb_api_key)"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f ~/credentials/wandb.env ]; then
+    source ~/credentials/wandb.env
 fi
 export WANDB_DIR="/tmp/wandb"
 mkdir -p "${WANDB_DIR}"
@@ -35,7 +35,7 @@ echo "started: $(date -Iseconds)"
 
 python examples/ctp_demo.py \
     --codec-mode mpeg4 \
-    --lance-uri /mnt/data/tables/s3_video_primary.lance \
+    --lance-uri /mnt/data/tables/s3_media_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
     --num-videos 500 \

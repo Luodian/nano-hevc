@@ -18,8 +18,8 @@ set -euo pipefail
 export S3_ENDPOINT_URL="https://storage.eu-north1.nebius.cloud"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials"
 export AWS_CONFIG_FILE="$HOME/.aws/config"
-if [ -z "${WANDB_API_KEY:-}" ] && [ -f /home/brian/.wandb_api_key ]; then
-    export WANDB_API_KEY="$(tr -d '\n' < /home/brian/.wandb_api_key)"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f ~/credentials/wandb.env ]; then
+    source ~/credentials/wandb.env
 fi
 export PYTHONUNBUFFERED=1
 
@@ -30,7 +30,7 @@ echo "=== test streaming (small) ==="
 python examples/ctp_demo.py \
     --streaming \
     --streaming-workers 2 \
-    --lance-uri /mnt/data/tables/s3_video_primary.lance \
+    --lance-uri /mnt/data/tables/s3_media_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
     --codec-mode mpeg4 \

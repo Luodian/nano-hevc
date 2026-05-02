@@ -12,7 +12,7 @@ Pipeline:
   6. Log everything to W&B (optional)
 
 Local:   python examples/ctp_demo.py
-Cluster: python examples/ctp_demo.py --lance-uri s3://ami-labs-data/tables/s3_video_primary.lance --datasets howto100m --num-videos 50 --wandb
+Cluster: python examples/ctp_demo.py --lance-uri s3://ami-labs-data/tables/s3_media_primary.lance --datasets howto100m --num-videos 50 --wandb
 """
 
 from __future__ import annotations

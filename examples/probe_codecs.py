@@ -10,7 +10,7 @@ from botocore.config import Config
 client = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT_URL"),
                       config=Config(connect_timeout=10, read_timeout=60))
 
-ds = lance.dataset("/mnt/data/tables/s3_video_primary.lance")
+ds = lance.dataset("/mnt/data/tables/s3_media_primary.lance")
 rows = ds.to_table(
     columns=["tar_path", "member_path", "offset", "size"],
     filter="tar_path LIKE '%/tars/howto100m/%'",
