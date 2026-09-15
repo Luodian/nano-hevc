@@ -19,4 +19,5 @@ export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials"
 export AWS_CONFIG_FILE="$HOME/.aws/config"
 export PYTHONUNBUFFERED=1
 pip install -e /home/brian/codebase/nano-hevc --quiet 2>&1 | tail -1
-python3 /home/brian/codebase/nano-hevc/examples/debug_torchcodec.py
+cd "$HOME/codebase/nano-hevc"
+python3 -m experiments.ctp.debug_torchcodec

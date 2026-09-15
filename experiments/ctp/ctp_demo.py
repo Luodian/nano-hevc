@@ -11,8 +11,8 @@ Pipeline:
   5. Report validation BPT against simple baselines
   6. Log everything to W&B (optional)
 
-Local:   python examples/ctp_demo.py
-Cluster: python examples/ctp_demo.py --lance-uri s3://ami-labs-data/tables/s3_media_primary.lance --datasets howto100m --num-videos 50 --wandb
+Local:   python -m experiments.ctp.ctp_demo
+Cluster: python -m experiments.ctp.ctp_demo --lance-uri s3://ami-labs-data/tables/s3_media_primary.lance --datasets howto100m --num-videos 50 --wandb
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from nano_hevc.encoder import encode_frame
 from nano_hevc.frame import Frame
 from nano_hevc.nal import HEVCConfig
 
-VIDEO = Path(__file__).parent / "birds.mp4"
+VIDEO = Path(__file__).resolve().parents[2] / "examples" / "assets" / "birds.mp4"
 PLANE_TO_ID = {"Y": 0, "U": 1, "V": 2}
 OPEN_VOCAB_UNIFORM_BITS = 8.0
 _VIDEO_EXTS = frozenset({".mp4", ".webm", ".mkv", ".avi", ".mov"})

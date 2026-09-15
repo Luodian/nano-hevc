@@ -43,7 +43,7 @@ echo "started: $(date -Iseconds)"
 # direct-to-tensor path: ~20x less memory than SymbolTrace
 # model: 12L x 12H x 768d = ~86M params (proven at 2K scale)
 # cosine LR decay to prevent the step-7500 collapse seen in the 2K run
-python examples/ctp_demo.py \
+python -m experiments.ctp.ctp_demo \
     --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_media_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \

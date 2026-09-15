@@ -151,91 +151,28 @@ def _get_transform_matrix(size: int, use_dst: bool = False) -> np.ndarray:
         raise ValueError(f"Unsupported transform size: {size}")
 
 
+def _apply_transform(block: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Apply both separable passes, rounding after each matrix multiply."""
+    shift = int(np.log2(block.shape[0])) + 5
+    rounding = 1 << (shift - 1)
+    temp = (matrix @ block.astype(np.int32) + rounding) >> shift
+    return (temp @ matrix.T + rounding) >> shift
+
+
 def forward_transform(residual: np.ndarray, use_dst: bool = False) -> np.ndarray:
+    """Transform a square residual block into int32 coefficients.
+
+    Use DCT for sizes 4, 8, 16, and 32, or DST-VII for 4x4 luma intra.
+    Each pass of T @ residual @ T.T includes integer rounding and scaling.
     """
-    Apply forward integer transform to residual block.
-
-    HEVC uses a separable 2D transform:
-    coefficients = T @ residual @ T.T
-
-    The transform includes scaling via bit shifts for integer precision.
-    Shift amount depends on transform size to handle matrix scaling.
-
-    Args:
-        residual: input residual block, shape (size, size)
-        use_dst: use DST-VII instead of DCT-II (for 4x4 luma intra)
-
-    Returns:
-        transform coefficients, shape (size, size), dtype int32
-    """
-    size = residual.shape[0]
-    T = _get_transform_matrix(size, use_dst)
-    log2_size = int(np.log2(size))
-    shift = log2_size + 5
-    rnd = 1 << (shift - 1)
-    block = residual.astype(np.int32)
-
-    # First pass: rows
-    temp = np.zeros((size, size), dtype=np.int32)
-    for i in range(size):
-        for j in range(size):
-            acc = 0
-            for k in range(size):
-                acc += T[i, k] * block[k, j]
-            temp[i, j] = (acc + rnd) >> shift
-
-    # Second pass: columns
-    coeff = np.zeros((size, size), dtype=np.int32)
-    for i in range(size):
-        for j in range(size):
-            acc = 0
-            for k in range(size):
-                acc += temp[i, k] * T[j, k]
-            coeff[i, j] = (acc + rnd) >> shift
-
-    return coeff
+    matrix = _get_transform_matrix(residual.shape[0], use_dst)
+    return _apply_transform(residual, matrix)
 
 
 def inverse_transform(coeff: np.ndarray, use_dst: bool = False) -> np.ndarray:
-    """
-    Apply inverse integer transform to coefficients.
-
-    Reconstructs residual from transform coefficients:
-    residual = T.T @ coefficients @ T
-
-    Args:
-        coeff: transform coefficients, shape (size, size)
-        use_dst: use DST-VII instead of DCT-II (for 4x4 luma intra)
-
-    Returns:
-        reconstructed residual, shape (size, size), dtype int32
-    """
-    size = coeff.shape[0]
-    T = _get_transform_matrix(size, use_dst)
-    log2_size = int(np.log2(size))
-    shift = log2_size + 5
-    rnd = 1 << (shift - 1)
-    block = coeff.astype(np.int32)
-
-    # First pass: columns
-    temp = np.zeros((size, size), dtype=np.int32)
-    for i in range(size):
-        for j in range(size):
-            acc = 0
-            for k in range(size):
-                acc += T[k, i] * block[k, j]
-            temp[i, j] = (acc + rnd) >> shift
-
-    # Second pass: rows
-    residual = np.zeros((size, size), dtype=np.int32)
-    for i in range(size):
-        for j in range(size):
-            acc = 0
-            for k in range(size):
-                acc += temp[i, k] * T[k, j]
-            residual[i, j] = (acc + rnd) >> shift
-
-    return residual
+    """Reconstruct int32 residuals using the transposed forward matrix."""
+    matrix = _get_transform_matrix(coeff.shape[0], use_dst)
+    return _apply_transform(coeff, matrix.T)
 
 
 def forward_transform_4x4(residual: np.ndarray, use_dst: bool = False) -> np.ndarray:

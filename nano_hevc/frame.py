@@ -9,7 +9,7 @@ Memory optimization features:
 """
 
 from __future__ import annotations
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 import numpy as np
 
 

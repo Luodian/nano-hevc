@@ -6,7 +6,7 @@ ftyp+moov+sidx, then writes a new Lance table with per-segment entries.
 Finally benchmarks full-video download vs single-GOP range read.
 
 Usage:
-    python build_gop_index.py \
+    python -m experiments.ctp.build_gop_index \
         --lance-uri /mnt/data/tables/s3_media_primary.lance \
         --datasets panda70m \
         --num-videos 5000 \

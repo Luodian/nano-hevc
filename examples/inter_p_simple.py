@@ -313,7 +313,7 @@ def main():
 """)
 
     # ── connection to birds.mp4 ──────────────────────────────────────
-    sect("REAL VIDEO: birds.mp4 (from analysis.md)")
+    sect("REAL VIDEO: birds.mp4 (from docs/birds_analysis.md)")
     print("""
   Frame Type | Count | Avg Size | Ratio
   -----------+-------+----------+------

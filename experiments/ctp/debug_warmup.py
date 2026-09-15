@@ -55,7 +55,7 @@ for v in videos[:10]:
             print(f"  frame {i}: pict_type={f.pict_type} mvs={n}")
 
         # now test the full extraction
-        from examples.ctp_demo import extract_mpeg4_traces_from_bytes
+        from experiments.ctp.ctp_demo import extract_mpeg4_traces_from_bytes
         traces = extract_mpeg4_traces_from_bytes(raw, 4, fps=8)
         if traces:
             print(f"  traces: {len(traces)} frames, {sum(len(t) for t in traces)} tokens")

@@ -5,8 +5,7 @@ Implements VPS, SPS, PPS, and slice header generation per ITU-T H.265.
 """
 
 from __future__ import annotations
-from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from nano_hevc.bitstream import BitstreamWriter, write_start_code_prefix
 

@@ -1,14 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=ctp-scale-500v
+#SBATCH --job-name=ctp-2k-128M
 #SBATCH --partition=main
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
-#SBATCH --output=/home/brian/logs/slurm/ctp-scale-%j.out
-#SBATCH --error=/home/brian/logs/slurm/ctp-scale-%j.err
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=0
+#SBATCH --exclusive
+#SBATCH --time=06:00:00
+#SBATCH --output=/home/brian/logs/slurm/ctp-2k-%j.out
+#SBATCH --error=/home/brian/logs/slurm/ctp-2k-%j.err
 #SBATCH --container-image=/mnt/data/enroot/base-pytorch-dali-torchcodec-25.03.sqsh
 #SBATCH --container-mounts=/mnt/data:/mnt/data,/home/brian:/home/brian
 #SBATCH --no-container-mount-home
@@ -28,41 +29,37 @@ export WANDB_DIR="/tmp/wandb"
 mkdir -p "${WANDB_DIR}"
 export PYTHONUNBUFFERED=1
 
-echo "=== CTP scale: 500 videos, 64M params, batch MPEG-4 ==="
+echo "=== CTP GOP: 2000 videos, 8 GOPs × 8 frames, 128M params ==="
 echo "node: $(hostname)"
 echo "gpu:  $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 echo "started: $(date -Iseconds)"
 
-# batch mode with MPEG-4 extraction — no streaming DataLoader needed
-# 500 videos x 8 frames = 4000 frames
-# MPEG-4 extraction: ~50ms/video = ~25s total (vs 16s/video HEVC = ~2.2h)
-# model: 8L x 8H x 512d ≈ 64M params
-python examples/ctp_demo.py \
+# 2000 videos x 8 GOPs x (1 I + 7 P/B) = ~128K frames
+# I-frame tokens = context (no loss), P/B tokens = prediction targets
+# model: 12L x 12H x 768d ≈ 128M params
+python -m experiments.ctp.ctp_demo \
     --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_media_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \
     --datasets howto100m \
-    --num-videos 500 \
-    --frames-per-video 8 \
-    --width 128 \
-    --height 64 \
-    --qp 27 \
-    --max-cu-size 8 \
-    --n-layer 8 \
-    --n-head 8 \
-    --n-embd 512 \
+    --num-videos 2000 \
+    --num-gops 8 \
+    --pframes-per-gop 7 \
+    --n-layer 12 \
+    --n-head 12 \
+    --n-embd 768 \
     --block-size 512 \
     --batch-size 32 \
-    --max-iters 5000 \
-    --eval-interval 200 \
+    --max-iters 10000 \
+    --eval-interval 500 \
     --eval-iters 20 \
     --learning-rate 3e-4 \
-    --warmup-steps 200 \
+    --warmup-steps 500 \
     --max-grad-norm 1.0 \
     --amp \
     --device cuda \
     --wandb \
     --wandb-project nano-hevc-ctp \
-    --wandb-run-name "ctp-500v-8L512d-mpeg4-batch"
+    --wandb-run-name "ctp-2kv-8gop-12L768d"
 
 echo "finished: $(date -Iseconds)"

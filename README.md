@@ -1,266 +1,85 @@
-<img width="100%" alt="Gemini_Generated_Image_s0u74hs0u74hs0u7" src="https://github.com/user-attachments/assets/95f9e48f-0b32-4008-9f7d-9b6b20b8cc4d" />
+<img width="100%" alt="nano-hevc banner" src="https://github.com/user-attachments/assets/95f9e48f-0b32-4008-9f7d-9b6b20b8cc4d" />
 
-A minimal, educational HEVC (H.265) encoder written in Python.
+# nano-hevc
 
-## Overview
+nano-hevc is a minimal Python implementation of HEVC (H.265) core algorithms designed for learning and teaching video compression. The codebase prioritizes readability and fundamental principles over production speed.
 
-nano-hevc is designed for **learning and teaching** video compression concepts.
-The code prioritizes clarity and readability over performance.
-
-## Features
-
-- [x] Frame/Plane abstractions with numpy
-- [x] Intra prediction (DC mode)
-- [x] Intra prediction (Planar mode)
-- [x] Intra prediction (Angular modes 2-34)
-- [x] Integer transform (4x4, 8x8, 16x16, 32x32 DCT)
-- [x] 4x4 DST-VII for luma intra blocks
-- [x] Quantization / Dequantization (QP 0-51)
-- [x] Zig-zag and other scan patterns (diagonal/horizontal/vertical)
-- [x] NHEVC1 container encode/decode round-trip
-- [x] ffmpeg backend for standards-compliant HEVC output
-- [x] Native HEVC output mode from nano backend (experimental)
-- [x] CABAC entropy coding core (coefficients + CBF, arithmetic engine tested)
-- [x] NAL unit generation (VPS/SPS/PPS/Slice)
-- [x] Full native HEVC-compliant intra-only bitstream from nano backend
-  - [x] Keep native CABAC path for all intra blocks
-  - [x] Encode CBF and residual coefficients for non-zero blocks
-- [x] Inter prediction / motion estimation (P/B coding)
-  - [x] Add full-search motion estimation for luma blocks
-  - [x] Add simple experimental P/B frame scheduling + reference list
-  - [x] Add CLI/API options for native inter and GOP/search controls
+The encoder predicts each block, transforms and quantizes the residual, then stores the result. Reconstruction reverses these steps and adds the prediction back.
 
 ## Installation
 
+Prerequisites:
+
+- Python 3.9+
+- uv
+- ffmpeg and ffprobe on your PATH
+- libx264 is required for the decoded MP4 preview example
+- libx265 is only required for optional standard HEVC output modes
+
+Clone the repository and install development dependencies:
+
 ```bash
-git clone https://github.com/yourusername/nano-hevc.git
+git clone https://github.com/the-AMI-Labs/nano-hevc.git
 cd nano-hevc
-
-uv sync
-
-pip install -e ".[dev]"
+uv sync --extra dev
 ```
 
 ## Quick Start
 
-```python
-import numpy as np
-from nano_hevc.intra import intra_dc_predict, intra_planar_predict, residual_block
-from nano_hevc.transform import forward_transform, inverse_transform
-from nano_hevc.quant import quantize_block, dequantize_block
-
-# reference pixels (for 4x4 block)
-top = np.array([102, 98, 100, 101], dtype=np.int16)
-left = np.array([103, 102, 101, 99], dtype=np.int16)
-
-# original block
-orig = np.array([
-    [102, 101, 100, 100],
-    [103, 102, 101, 100],
-    [103, 102, 100,  99],
-    [104, 101,  99,  98],
-], dtype=np.int16)
-
-# dc prediction
-pred = intra_dc_predict(top, left, size=4)
-print(f"DC value: {pred[0, 0]}")  # 101
-
-# compute residual
-residual = residual_block(orig, pred)
-
-# transform (dst for 4x4 luma intra)
-coeff = forward_transform(residual, use_dst=True)
-
-# Quantize (QP=22 for decent quality)
-levels = quantize_block(coeff, qp=22)
-print(f"Non-zero coefficients: {np.count_nonzero(levels)}")
-
-# decoder side: dequantize and inverse transform
-recon_coeff = dequantize_block(levels, qp=22)
-recon_residual = inverse_transform(recon_coeff, use_dst=True)
-```
-
-Encode a raw YUV420p file with the `nano` backend (NHEVC1 container):
-
-```python
-from nano_hevc.encoder import encode_video
-
-stats = encode_video(
-    "input.yuv",
-    "output.nhevc",
-    width=640,
-    height=360,
-    num_frames=1,
-    qp=27,
-    backend="nano",
-)
-print(stats)
-```
-
-Encode with `nano` reconstruction + standard HEVC output (intra-only GOP):
+Encode 3 frames of the included sample video into the educational NHEVC1 container format, then decode the bitstream back to an MP4 video:
 
 ```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull_300f_640x360.mp4 \
-  -o /tmp/red_bull_300f.nano.std.hevc \
-  --width 640 --height 360 --frames 300 \
-  --backend nano --qp 27 --fast \
-  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28 \
-  --nano-standard-intra-only
+mkdir -p outputs
+uv run nano-hevc examples/assets/birds.mp4 -o outputs/birds.nhevc \
+  --width 128 --height 128 --frames 3 --backend nano --qp 27 --fast
+uv run nano-hevc outputs/birds.nhevc -o outputs/birds.decoded.mp4 \
+  --decode-nano
 ```
 
-If your goal is bitrate parity with ffmpeg defaults, do not set
-`--nano-standard-intra-only` so ffmpeg can use P/B frames.
+Open `outputs/birds.decoded.mp4` to view three reconstructed frames.
 
-Experimental native HEVC output (generated by nano-hevc syntax path):
+NHEVC1 is the project's custom container format and requires the nano decoder. Native HEVC output is experimental. For standard HEVC output, use one of the [ffmpeg modes](docs/usage.md#standard-hevc-encoding).
 
-```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
-  -o /tmp/red_bull_first2min.nano.native.hevc \
-  --width 640 --height 360 --frames 300 \
-  --backend nano --qp 27 --fast --nano-native-hevc
+## Source Reading Order
+
+Explore the codebase in the following sequence to follow how video data moves through the codec:
+
+1. [nano_hevc/frame.py](nano_hevc/frame.py) and [nano_hevc/block.py](nano_hevc/block.py): Frame buffers, YUV planes, and block slicing abstractions.
+2. [nano_hevc/intra.py](nano_hevc/intra.py): Spatial intra prediction (DC, Planar, and angular modes) and residual calculation.
+3. [nano_hevc/transform.py](nano_hevc/transform.py) and [nano_hevc/quant.py](nano_hevc/quant.py): Integer DCT/DST transforms and scalar quantization across QP 0-51.
+4. [nano_hevc/scan.py](nano_hevc/scan.py) and [nano_hevc/cabac.py](nano_hevc/cabac.py): Coefficient scan orders and the CABAC arithmetic entropy engine.
+5. [nano_hevc/bitstream.py](nano_hevc/bitstream.py) and [nano_hevc/nal.py](nano_hevc/nal.py): Emulation prevention byte stuffing and NAL unit packaging (VPS, SPS, PPS, Slice).
+6. [nano_hevc/encoder.py](nano_hevc/encoder.py): Pipeline orchestration connecting prediction, transformation, entropy coding, and file I/O.
+
+The native HEVC path uses CABAC and NAL units. The NHEVC1 container stores block modes and compressed coefficients in its own format.
+
+## Repository Layout
+
+```text
+nano_hevc/        Core codec implementation
+examples/         Small teaching demos
+  assets/         Sample videos, metadata, and reference image
+docs/             Usage guide and longer explanations
+experiments/ctp/   Codec-token prediction training and debugging
+  slurm/          Cluster launch scripts
+tests/            Codec tests
 ```
 
-This mode is syntax-level experimental: the stream is decodable by standard
-HEVC decoders, but coding syntax is still incomplete and visual fidelity is
-not yet at production quality.
-Current native mode now keeps a full intra residual path (no forced zero CBF), so
-`cbf` and coefficients are carried when non-zero and are still decoded by the
-same experimental pathway. Quality/efficiency remains educational.
+## Further Usage
 
-For native experimental inter coding:
+- Read [docs/usage.md](docs/usage.md) for alternative encoding modes, standard ffmpeg backend flags, and parameter options.
+- Read [docs/frames_and_panes.md](docs/frames_and_panes.md) for an article in Chinese explaining the frame and plane data layout.
+- Run [examples/inter_p_simple.py](examples/inter_p_simple.py) for a standalone synthetic demonstration of I, P, and B prediction logic.
+- See [docs/birds_analysis.md](docs/birds_analysis.md) for deeper sample analysis and experimental tokenization research (not required for onboarding).
 
-```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull_first2min_640x360.mp4 \
-  -o /tmp/red_bull_first2min.nano.native.inter.hevc \
-  --width 640 --height 360 --frames 300 \
-  --backend nano --qp 27 --fast --nano-native-hevc --nano-native-inter \
-  --nano-native-gop-size 30 --nano-native-search-range 8
-```
-
-Decode `nano` container back to YUV/MP4:
-
-```bash
-# to raw yuv420p
-uv run python -m nano_hevc.encoder output.nhevc -o decoded.yuv --decode-nano
-
-# to mp4
-uv run python -m nano_hevc.encoder output.nhevc -o decoded.mp4 --decode-nano --decode-codec libx264
-```
-
-## Red Bull Example Workflow (First 2 Minutes)
-
-Use local HD source:
-
-```bash
-cp /Users/luodian/Downloads/red_bull.mp4 examples/videos/red_bull.mp4
-```
-
-Analyze the first 2 minutes (I/P/B distribution):
-
-```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
-  --analyze --start-time 0 --duration 120 --frames 3000
-```
-
-Run full `nano` container round-trip directly from the source video
-(no manual pre-trim needed):
-
-```bash
-# encode to nano container
-uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
-  -o /tmp/red_bull_first2min.nano.nhevc \
-  --width 640 --height 360 --frames 3000 --start-time 0 --duration 120 \
-  --backend nano --qp 27 --fast --show-frame-types
-
-# decode nano container back to playable mp4
-uv run python -m nano_hevc.encoder /tmp/red_bull_first2min.nano.nhevc \
-  -o /tmp/red_bull_first2min.decoded.mp4 --decode-nano --decode-codec libx264
-```
-
-Output standard HEVC from nano backend (reconstructed frames piped to ffmpeg):
-
-```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
-  -o /tmp/red_bull_first2min.nano.std.hevc \
-  --width 640 --height 360 --frames 3000 --start-time 0 --duration 120 \
-  --backend nano --qp 27 --fast --show-frame-types \
-  --nano-standard-hevc --nano-standard-codec libx265 --nano-standard-crf 28 \
-  --verify-decoded-psnr
-```
-
-Baseline standard HEVC directly from ffmpeg backend:
-
-```bash
-uv run python -m nano_hevc.encoder examples/videos/red_bull.mp4 \
-  -o /tmp/red_bull_first2min.ffmpeg.hevc \
-  --width 640 --height 360 --frames 3000 --start-time 0 --duration 120 \
-  --backend ffmpeg --ffmpeg-codec libx265 --ffmpeg-crf 28 --show-frame-types \
-  --verify-decoded-psnr
-```
-
-`--verify-decoded-psnr` decodes the produced bitstream and reports actual luma
-PSNR against the encoded input segment, which is the reliable way to compare
-native vs standard output quality.
-Without this flag, the `nano` backend PSNR is reconstruction PSNR from the
-in-memory pipeline, not decoder-validated PSNR from the final bitstream.
-
-Compare bitrates:
-
-```bash
-for f in /tmp/red_bull_first2min.nano.nhevc \
-         /tmp/red_bull_first2min.nano.std.hevc \
-         /tmp/red_bull_first2min.ffmpeg.hevc; do
-  echo "=== $f ==="
-  ffprobe -hide_banner -loglevel error -show_entries format=size,bit_rate,duration \
-    -of default=noprint_wrappers=1 "$f" || true
-done
-```
-
-Verify decoded output:
-
-```bash
-ffprobe -hide_banner -loglevel error -count_frames -select_streams v:0 \
-  -show_entries stream=codec_name,width,height,avg_frame_rate,nb_read_frames,pix_fmt \
-  -show_entries format=duration,size,bit_rate \
-  -of default=noprint_wrappers=1 /tmp/red_bull_first2min.decoded.mp4
-```
+See [examples/README.md](examples/README.md) for the demo order. The [CTP experiments](experiments/ctp/README.md) require additional dependencies and have their own entry point.
 
 ## Running Tests
 
-> to make sure that I understand the HEVC's logic correctly, I advise GPT5.1/Gemini 3.0 Pro and industry experts to provide test suggestions before I start the project.
+[test_core.py](tests/test_core.py) covers prediction, transforms, and quantization. [test_encoder.py](tests/test_encoder.py) covers bitstreams and encode/decode round-trips.
 
 ```bash
 uv run pytest
-
-pytest
-```
-
-## Project Structure
-
-```
-nano_hevc/
-  pyproject.toml          # Package configuration
-  README.md
-  nano_hevc/
-    __init__.py
-    frame.py              # Frame/Plane abstractions
-    block.py              # Block view (numpy slices)
-    intra.py              # Intra prediction (DC, Planar, Angular)
-    transform.py          # Integer DCT/DST transforms
-    quant.py              # Quantization / Dequantization
-    scan.py               # Scan patterns (diagonal/horizontal/vertical)
-    bitstream.py          # Bitstream writer with emulation prevention
-    cabac.py              # CABAC entropy coding core (syntax wiring still partial)
-    nal.py                # NAL unit generation (VPS/SPS/PPS/Slice)
-    encoder.py            # Nano/ffmpeg backends + nano container decode
-    metrics.py            # PSNR utilities
-  tests/
-    test_encoder.py
-    test_intra_dc.py
-    test_intra_planar.py
-    test_intra_angular.py
-    test_transform.py
-    test_quant.py
 ```
 
 ## References
@@ -273,6 +92,8 @@ nano_hevc/
 MIT License
 
 Use as you wish, but please cite LOL
+
+## Citation
 
 ```bibtex
 @misc{nano-hevc,

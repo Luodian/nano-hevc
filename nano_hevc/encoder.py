@@ -37,7 +37,6 @@ from nano_hevc.scan import (
 )
 from nano_hevc.cabac import (
     CabacEncoder,
-    SymbolTrace,
     init_contexts_for_slice,
     encode_coeff_abs_level_remaining,
 )
@@ -591,13 +590,7 @@ def encode_inter_block(
             mv = ((cand_0.mv_x + cand_1.mv_x) // 2, (cand_0.mv_y + cand_1.mv_y) // 2)
             ref_idx = -1
 
-    use_dst = size == 4
-    residual = residual_block(original, predicted)
-    coeff = forward_transform(residual, use_dst=use_dst)
-    quant_coeff = quantize_block(coeff, qp)
-    dequant_coeff = dequantize_block(quant_coeff, qp)
-    recon_res = inverse_transform(dequant_coeff, use_dst=use_dst)
-    recon = clip_to_pixel_range(reconstruct_block(predicted, recon_res.astype(np.int16)))
+    quant_coeff, recon = _encode_residual(original, predicted, qp, use_dst=size == 4)
     recon_plane.data[y : y + size, x : x + size] = recon
 
     cbf = not is_all_zero(quant_coeff)
@@ -610,6 +603,17 @@ def encode_inter_block(
         motion_vector=mv,
         reference_index=ref_idx,
     )
+
+
+def _encode_residual(
+    original: np.ndarray, prediction: np.ndarray, qp: int, use_dst: bool
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantize a prediction residual and reconstruct its pixel block."""
+    residual = residual_block(original, prediction)
+    coeffs = quantize_block(forward_transform(residual, use_dst), qp)
+    recon_residual = inverse_transform(dequantize_block(coeffs, qp), use_dst)
+    recon = reconstruct_block(prediction, recon_residual.astype(np.int16))
+    return coeffs, clip_to_pixel_range(recon)
 
 
 def evaluate_intra_mode(
@@ -626,14 +630,7 @@ def evaluate_intra_mode(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Evaluate an intra mode and return cost metrics."""
     pred = predict_block(top, left, top_right, bottom_left, top_left, mode, size)
-    res = residual_block(original, pred)
-
-    coeff = forward_transform(res, use_dst=use_dst)
-    quant_coeff = quantize_block(coeff, qp)
-
-    dequant_coeff = dequantize_block(quant_coeff, qp)
-    recon_res = inverse_transform(dequant_coeff, use_dst=use_dst)
-    recon = clip_to_pixel_range(reconstruct_block(pred, recon_res.astype(np.int16)))
+    quant_coeff, recon = _encode_residual(original, pred, qp, use_dst)
 
     ssd = int(np.sum((original.astype(np.int32) - recon.astype(np.int32)) ** 2))
     num_nonzero = int(np.count_nonzero(quant_coeff))
@@ -668,12 +665,11 @@ def encode_block(
 
     best_mode = INTRA_MODE_DC
     best_cost = float("inf")
-    best_pred = None
     best_coeffs = None
     best_recon = None
 
     for mode in modes_to_test:
-        pred, coeffs, recon, cost = evaluate_intra_mode(
+        _, coeffs, recon, cost = evaluate_intra_mode(
             original,
             top,
             left,
@@ -688,7 +684,6 @@ def encode_block(
         if cost < best_cost:
             best_cost = cost
             best_mode = mode
-            best_pred = pred
             best_coeffs = coeffs
             best_recon = recon
 
@@ -1621,7 +1616,7 @@ def encode_video(
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="nano-hevc: Minimal HEVC encoder")
+    parser = argparse.ArgumentParser(prog="nano-hevc", description="nano-hevc: Minimal HEVC encoder")
     parser.add_argument("input", help="Input video file (YUV420p or MP4)")
     parser.add_argument(
         "-o",
@@ -1805,7 +1800,7 @@ def main():
     if args.width is None or args.height is None:
         parser.error("--width and --height are required for encode mode")
 
-    print(f"nano-hevc encoder")
+    print("nano-hevc encoder")
     print(f"Input:  {args.input}")
     print(f"Output: {args.output}")
     print(f"Size:   {args.width}x{args.height}")
@@ -1868,7 +1863,7 @@ def main():
     )
 
     print()
-    print(f"Encoding complete!")
+    print("Encoding complete!")
     print(f"  Frames:     {stats['frames']}")
     if "output_format" in stats:
         print(f"  Format:     {stats['output_format']}")

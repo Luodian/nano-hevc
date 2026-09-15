@@ -5,10 +5,8 @@ Implements the entropy coding engine per ITU-T H.265 Section 9.3.
 """
 
 from __future__ import annotations
-from typing import List, Optional, NamedTuple
-import numpy as np
+from typing import List, NamedTuple
 
-from nano_hevc.bitstream import BitstreamWriter
 
 
 CABAC_LPS_RANGE = [

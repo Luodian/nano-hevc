@@ -26,6 +26,11 @@ htmlcov/
 *.swp
 *.swo
 *.md
+!README.md
+!docs/usage.md
+!docs/birds_analysis.md
+!examples/README.md
+!experiments/ctp/README.md
 
 # OS
 .DS_Store
@@ -34,6 +39,7 @@ Thumbs.db
 # Local dev
 *.local
 .env
+outputs/
 
 # Draft docs
 docs/hevc_binary_decoder_deepdive.md

@@ -41,7 +41,7 @@ echo "node: $(hostname)"
 echo "gpu:  $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "started: $(date -Iseconds)"
 
-python examples/ctp_demo.py \
+python -m experiments.ctp.ctp_demo \
     --codec-mode mpeg4 \
     --lance-uri /mnt/data/tables/s3_media_primary.lance \
     --s3-endpoint https://storage.eu-north1.nebius.cloud \

@@ -10,7 +10,7 @@ actually stores for I / P / B frames:
   P-frame: motion vectors + sparse residual
   B-frame: bidirectional MVs + sparser residual
 
-Output: examples/frame_repr_viz.png
+Output: examples/assets/frame_repr_viz.png
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ import matplotlib.gridspec as gridspec
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-VIDEO = Path(__file__).parent / "birds.mp4"
-OUT = Path(__file__).parent / "frame_repr_viz.png"
+VIDEO = Path(__file__).parent / "assets" / "birds.mp4"
+OUT = Path(__file__).parent / "assets" / "frame_repr_viz.png"
 
 # downscale for visualization (original is 3840x1620)
 SCALE_W, SCALE_H = 480, 202

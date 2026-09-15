@@ -27,7 +27,7 @@ cd "$HOME/codebase/nano-hevc"
 pip install av -e . --quiet 2>&1 | tail -1
 
 echo "=== test streaming (small) ==="
-python examples/ctp_demo.py \
+python -m experiments.ctp.ctp_demo \
     --streaming \
     --streaming-workers 2 \
     --lance-uri /mnt/data/tables/s3_media_primary.lance \
